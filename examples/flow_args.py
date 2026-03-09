@@ -47,8 +47,9 @@ def get_args() -> argparse.Namespace:
     # 3. Model Architecture
     # ----------------------------------------------------------------------
     parser.add_argument("--model_type", type=str, default="geowno",
-                        choices=["geofno", "geowno"],
-                        help="Neural operator architecture: GeoFNO (Fourier) or GeoWNO (Haar Wavelet).")
+                        choices=["geofno", "geowno", "geofnot", "transolver"],
+                        help="Neural operator architecture: GeoFNO (Fourier), GeoWNO (Haar Wavelet), "
+                             "GeoFNOT (Fourier + KNN-IDW + temporal), or Transolver (Physics-Attention, grid-free).")
 
     parser.add_argument("--modes", type=int, nargs='+', default=[12, 12],
                         help="Number of Fourier/wavelet modes per dimension "
@@ -84,6 +85,11 @@ def get_args() -> argparse.Namespace:
     parser.add_argument("--wavelet_levels", type=int, default=2,
                         help="[GeoWNO] Number of Haar DWT decomposition levels (J). "
                              "J=1 = single-level, J=2 = two-level multi-resolution.")
+
+    # Transolver-specific params
+    parser.add_argument("--num_slices", type=int, default=32,
+                        help="[Transolver] Number of physics slice tokens (M). "
+                             "Higher M captures more distinct physics modes at higher memory cost.")
 
     # ----------------------------------------------------------------------
     # 4. Training Strategy

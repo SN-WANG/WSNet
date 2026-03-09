@@ -20,6 +20,8 @@ if project_root not in sys.path: sys.path.insert(0, project_root)
 
 from wsnet.models.neural.geofno import GeoFNO
 from wsnet.models.neural.geowno import GeoWNO
+from wsnet.models.neural.geofnot import GeoFNOT
+from wsnet.models.neural.transolver import Transolver
 
 from wsnet.data.flow_data import FlowData
 from wsnet.data.flow_vis import FlowVis
@@ -98,8 +100,27 @@ def _build_model(args: argparse.Namespace) -> torch.nn.Module:
             rff_sigma=args.rff_sigma,
             wavelet_levels=args.wavelet_levels,
         )
+    elif args.model_type == "geofnot":
+        return GeoFNOT(
+            in_channels=in_ch, out_channels=out_ch,
+            modes=args.modes, latent_grid_size=args.latent_grid_size,
+            depth=args.depth, width=args.width,
+            deformation_kwargs=deform_kw,
+            knn_k=args.knn_k,
+            time_features=args.time_features,
+            max_steps=args.max_steps,
+        )
+    elif args.model_type == "transolver":
+        return Transolver(
+            in_channels=in_ch, out_channels=out_ch,
+            spatial_dim=args.spatial_dim,
+            width=args.width, depth=args.depth,
+            num_slices=args.num_slices,
+            time_features=args.time_features,
+            max_steps=args.max_steps,
+        )
     else:
-        raise ValueError(f"Unknown model_type '{args.model_type}'. Choices: geofno, geowno")
+        raise ValueError(f"Unknown model_type '{args.model_type}'. Choices: geofno, geowno, geofnot, transolver")
 
 
 # ======================================================================

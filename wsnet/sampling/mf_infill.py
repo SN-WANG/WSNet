@@ -1,11 +1,10 @@
 # Multi-Fidelity Infill via MICO (Mutual Information and Correlation Criterion)
-# Paper: Wang et al. (2024) "Optimal sensor placement for digital twin based on
-#        mutual information and correlation with multi-fidelity data"
-#        https://doi.org/10.1007/s00366-023-01858-z
+# Paper reference: https://doi.org/10.1007/s00366-023-01858-z
+# Paper author: Shuo Wang, Xiaonan Lai, Xiwang He, Kunpeng Li, Liye Lv, Xueguan Song
 # Code author: Shengning Wang
 
 import numpy as np
-from typing import List, Optional, Union
+from typing import List, Optional
 
 from wsnet.sampling.base_infill import BaseInfill
 from wsnet.data.scaler import MinMaxScalerNP
@@ -40,14 +39,14 @@ class MultiFidelityInfill(BaseInfill):
         y_hf (np.ndarray): HF training responses. shape: (num_hf, output_dim).
         x_lf (np.ndarray): LF candidate pool. shape: (num_lf, input_dim).
         y_lf (np.ndarray): LF responses at pool locations. shape: (num_lf, output_dim).
-        target_index (int): Output dimension used to score candidates.
+        target_idx (int): Output dimension used to score candidates.
         ratio (float): Weight for MI term vs. distance-diversity term, in [0, 1].
         theta_v (np.ndarray): LF process correlation lengths. shape: (input_dim,).
         theta_d (np.ndarray): Discrepancy correlation lengths. shape: (input_dim,).
         rho (np.ndarray): HF/LF scaling factors. shape: (output_dim,).
         sigma_sq_v (np.ndarray): LF process variance. shape: (output_dim,).
         sigma_sq_d (np.ndarray): Discrepancy variance. shape: (output_dim,).
-        hf_indices (np.ndarray): LF pool indices nearest to each HF observation.
+        hf_idxs (np.ndarray): LF pool indices nearest to each HF observation.
             shape: (num_hf,).
     """
 
@@ -58,7 +57,7 @@ class MultiFidelityInfill(BaseInfill):
         y_hf: np.ndarray,
         x_lf: np.ndarray,
         y_lf: np.ndarray,
-        target_index: int = 0,
+        target_idx: int = 0,
         ratio: float = 0.5,
         theta_v: Optional[np.ndarray] = None,
         theta_d: Optional[np.ndarray] = None,
@@ -74,7 +73,7 @@ class MultiFidelityInfill(BaseInfill):
                 shape: (num_lf, input_dim).
             y_lf (np.ndarray): LF responses at candidate locations.
                 shape: (num_lf, output_dim).
-            target_index (int): Output dimension to optimise. Default 0.
+            target_idx (int): Output dimension to optimise. Default 0.
             ratio (float): Weight of MI term vs. diversity term, in [0, 1].
                 ratio=1 is pure MI; ratio=0 is pure distance-diversity. Default 0.5.
             theta_v (Optional[np.ndarray]): Correlation lengths for the LF process.
@@ -85,7 +84,7 @@ class MultiFidelityInfill(BaseInfill):
         Raises:
             RuntimeError: If ``model`` is not fitted.
         """
-        super().__init__(model, bounds=None, target_index=target_index, num_restarts=0)
+        super().__init__(model, bounds=None, target_idx=target_idx, num_restarts=0)
 
         self.x_hf = np.array(x_hf, dtype=np.float64)
         self.y_hf = np.array(y_hf, dtype=np.float64)
@@ -104,11 +103,11 @@ class MultiFidelityInfill(BaseInfill):
             else self.theta_v.copy()
         )
 
-        self.rho       = self._estimate_rho()
+        self.rho        = self._estimate_rho()
         self.sigma_sq_v = self._estimate_sigma_sq_v()
         self.sigma_sq_d = self._estimate_sigma_sq_d()
 
-        self.hf_indices = self._map_hf_to_lf()
+        self.hf_idxs = self._map_hf_to_lf()
         self._scaler_dist = MinMaxScalerNP(norm_range="unit")
 
     # ------------------------------------------------------------------
@@ -243,7 +242,7 @@ class MultiFidelityInfill(BaseInfill):
         return np.exp(-d_sq)
 
     def _mf_covariance(
-        self, x1: np.ndarray, x2: np.ndarray, output_dim: int
+        self, x1: np.ndarray, x2: np.ndarray, out_idx: int
     ) -> np.ndarray:
         """
         Compute the multi-fidelity co-kriging covariance matrix.
@@ -255,14 +254,14 @@ class MultiFidelityInfill(BaseInfill):
         Args:
             x1 (np.ndarray): First point set. shape: (n1, input_dim).
             x2 (np.ndarray): Second point set. shape: (n2, input_dim).
-            output_dim (int): Index of the output dimension.
+            out_idx (int): Index of the output dimension.
 
         Returns:
             np.ndarray: Covariance matrix. shape: (n1, n2).
         """
-        rho_d   = self.rho[output_dim]
-        sigma_v = self.sigma_sq_v[output_dim]
-        sigma_d = self.sigma_sq_d[output_dim]
+        rho_d   = self.rho[out_idx]
+        sigma_v = self.sigma_sq_v[out_idx]
+        sigma_d = self.sigma_sq_d[out_idx]
         psi_v   = self._correlation_matrix(x1, x2, self.theta_v)
         psi_d   = self._correlation_matrix(x1, x2, self.theta_d)
         return (rho_d ** 2 * sigma_v) * psi_v + sigma_d * psi_d
@@ -273,9 +272,9 @@ class MultiFidelityInfill(BaseInfill):
 
     def _compute_mico_scores(
         self,
-        candidate_indices: np.ndarray,
-        selected_indices: List[int],
-        output_dim: int,
+        candidate_idxs: np.ndarray,
+        selected_idxs: List[int],
+        out_idx: int,
     ) -> np.ndarray:
         """
         Compute raw MICO ``delta = delta_n * delta_d`` scores for candidates.
@@ -284,27 +283,27 @@ class MultiFidelityInfill(BaseInfill):
         the code duplication present in the original implementation.
 
         Args:
-            candidate_indices (np.ndarray): Indices into ``x_lf`` to score.
-                shape: (n_candidates,).
-            selected_indices (List[int]): Indices into ``x_lf`` already chosen
+            candidate_idxs (np.ndarray): Indices into ``x_lf`` to score.
+                shape: (num_cands,).
+            selected_idxs (List[int]): Indices into ``x_lf`` already chosen
                 (seed from nearest-neighbour HF mapping).
-            output_dim (int): Output dimension index.
+            out_idx (int): Output dimension index.
 
         Returns:
-            np.ndarray: MICO delta scores. shape: (n_candidates,).
+            np.ndarray: MICO delta scores. shape: (num_cands,).
                 Returns zeros if no candidates are provided.
         """
-        n_cand = len(candidate_indices)
-        if n_cand == 0:
+        num_cands = len(candidate_idxs)
+        if num_cands == 0:
             return np.zeros(0, dtype=np.float64)
 
-        x_selected  = self.x_lf[selected_indices]
-        x_candidates = self.x_lf[candidate_indices]
+        x_selected   = self.x_lf[selected_idxs]
+        x_candidates = self.x_lf[candidate_idxs]
 
         # Covariance of the already-selected set: C_AA
-        n_sel = len(selected_indices)
-        c_aa = self._mf_covariance(x_selected, x_selected, output_dim)
-        c_aa += np.eye(n_sel, dtype=np.float64) * 1e-6
+        num_sel = len(selected_idxs)
+        c_aa = self._mf_covariance(x_selected, x_selected, out_idx)
+        c_aa += np.eye(num_sel, dtype=np.float64) * 1e-6
 
         try:
             icov_a = np.linalg.inv(c_aa)
@@ -312,11 +311,11 @@ class MultiFidelityInfill(BaseInfill):
             icov_a = np.linalg.pinv(c_aa)
 
         # Cross-covariance candidates → selected: C_yA
-        c_ya = self._mf_covariance(x_candidates, x_selected, output_dim)  # (n_cand, n_sel)
+        c_ya = self._mf_covariance(x_candidates, x_selected, out_idx)  # (num_cands, num_sel)
 
         # Self-covariance of candidates: C_vv
-        c_vv = self._mf_covariance(x_candidates, x_candidates, output_dim)  # (n_cand, n_cand)
-        c_vv += np.eye(n_cand, dtype=np.float64) * 1e-6
+        c_vv = self._mf_covariance(x_candidates, x_candidates, out_idx)  # (num_cands, num_cands)
+        c_vv += np.eye(num_cands, dtype=np.float64) * 1e-6
 
         try:
             icov_vv = np.linalg.inv(c_vv)
@@ -324,7 +323,7 @@ class MultiFidelityInfill(BaseInfill):
             icov_vv = np.linalg.pinv(c_vv)
 
         # MICO: delta_n = diag(C_vv - C_yA @ C_AA^{-1} @ C_yA^T)
-        #        delta_d = diag(C_vv^{-1})
+        #       delta_d = diag(C_vv^{-1})
         temp    = c_ya @ icov_a @ c_ya.T
         delta_n = np.maximum(np.diag(c_vv - temp), 1e-12)
         delta_d = np.maximum(np.diag(icov_vv), 1e-12)
@@ -352,10 +351,10 @@ class MultiFidelityInfill(BaseInfill):
         """
         x = np.array(x, dtype=np.float64)
         dists = self._compute_sq_dists(x, self.x_lf)
-        indices = np.argmin(dists, axis=1).astype(np.int64)
+        idxs  = np.argmin(dists, axis=1).astype(np.int64)
 
-        selected = list(self.hf_indices.copy())
-        return self._compute_mico_scores(indices, selected, self.target_index).reshape(-1, 1)
+        selected_idxs = list(self.hf_idxs.copy())
+        return self._compute_mico_scores(idxs, selected_idxs, self.target_idx).reshape(-1, 1)
 
     def propose(self) -> np.ndarray:
         """
@@ -371,11 +370,11 @@ class MultiFidelityInfill(BaseInfill):
         Returns:
             np.ndarray: Coordinates of the proposed point. shape: (1, input_dim).
         """
-        selected = list(self.hf_indices.copy())
+        selected_idxs = list(self.hf_idxs.copy())
 
         # Candidate set: pool locations not already selected
         candidate_mask = np.ones(self.num_lf, dtype=bool)
-        candidate_mask[selected] = False
+        candidate_mask[selected_idxs] = False
         candidates = np.where(candidate_mask)[0]
 
         if len(candidates) == 0:
@@ -383,7 +382,7 @@ class MultiFidelityInfill(BaseInfill):
             return self.x_lf[fallback].reshape(1, -1)
 
         # MICO scores for all candidates
-        delta = self._compute_mico_scores(candidates, selected, self.target_index)
+        delta = self._compute_mico_scores(candidates, selected_idxs, self.target_idx)
 
         d_min, d_max = np.min(delta), np.max(delta)
         delta_norm = (
@@ -394,7 +393,7 @@ class MultiFidelityInfill(BaseInfill):
 
         # Distance-diversity score: min Euclidean distance to selected set
         x_candidates = self.x_lf[candidates]
-        x_selected   = self.x_lf[selected]
+        x_selected   = self.x_lf[selected_idxs]
         dists_all    = self._compute_sq_dists(x_candidates, x_selected)
         dists        = np.min(dists_all, axis=1)
 

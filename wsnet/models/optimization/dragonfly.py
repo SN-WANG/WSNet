@@ -13,9 +13,7 @@ The public entry point ``dragonfly_optimize`` mirrors the SciPy
 ``differential_evolution`` interface so it can be used as a drop-in replacement
 for constrained / unconstrained, single / multi-objective problems.
 
-Dependencies:
-    numpy  >= 1.24
-    scipy  >= 1.10
+Code author: Shengning Wang
 """
 
 from __future__ import annotations

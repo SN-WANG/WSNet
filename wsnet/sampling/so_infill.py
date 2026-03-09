@@ -28,7 +28,7 @@ class SingleObjectiveInfill(BaseInfill):
     Attributes:
         model: Pre-trained Kriging surrogate model.
         bounds (np.ndarray): Design space bounds. shape: (num_features, 2).
-        target_index (int): Output dimension to optimise.
+        target_idx (int): Output dimension to optimise.
         y_min (float): Current best (minimum) observed target value.
         criterion_name (str): Active criterion identifier.
         kappa (float): Exploration parameter for LCB. Default 2.0.
@@ -41,7 +41,7 @@ class SingleObjectiveInfill(BaseInfill):
         bounds: Union[List[float], np.ndarray],
         y_train: np.ndarray,
         criterion: str = "ei",
-        target_index: int = 0,
+        target_idx: int = 0,
         num_restarts: int = 10,
         kappa: float = 2.0,
     ) -> None:
@@ -56,7 +56,7 @@ class SingleObjectiveInfill(BaseInfill):
                 shape: (n_train, num_outputs).
             criterion (str): Acquisition function. Options: ``"mse"``, ``"poi"``,
                 ``"ei"``, ``"lcb"``. Default ``"ei"``.
-            target_index (int): Output dimension to optimise. Default 0.
+            target_idx (int): Output dimension to optimise. Default 0.
             num_restarts (int): Random restarts for L-BFGS-B. Default 10.
             kappa (float): Exploration coefficient for LCB. Default 2.0.
 
@@ -64,11 +64,11 @@ class SingleObjectiveInfill(BaseInfill):
             RuntimeError: If the model is not fitted.
             ValueError: If ``criterion`` is not recognised.
         """
-        super().__init__(model, bounds=bounds, target_index=target_index,
+        super().__init__(model, bounds=bounds, target_idx=target_idx,
                          num_restarts=num_restarts)
 
         self.kappa = float(kappa)
-        self.y_min = float(np.min(y_train[:, self.target_index]))
+        self.y_min = float(np.min(y_train[:, self.target_idx]))
 
         criterion_map = {
             "mse": self._crit_mse,
@@ -177,8 +177,8 @@ class SingleObjectiveInfill(BaseInfill):
         """
         y_pred, mse_pred = self.model.predict(x)
 
-        mu  = y_pred[:, self.target_index].reshape(-1, 1)
-        var = mse_pred[:, self.target_index].reshape(-1, 1)
+        mu  = y_pred[:, self.target_idx].reshape(-1, 1)
+        var = mse_pred[:, self.target_idx].reshape(-1, 1)
         sigma = np.sqrt(np.maximum(var, 1e-12))
 
         return self._criterion_func(mu, sigma)

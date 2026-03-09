@@ -24,7 +24,7 @@ class BaseInfill:
     Attributes:
         model: Pre-trained surrogate model (must expose a ``predict`` method).
         bounds (np.ndarray): Design variable bounds. shape: (num_features, 2).
-        target_index (int): Output dimension index used by the criterion.
+        target_idx (int): Output dimension index used by the criterion.
         num_restarts (int): Number of random restarts for the default optimizer.
     """
 
@@ -32,7 +32,7 @@ class BaseInfill:
         self,
         model,
         bounds: Optional[Union[List[float], np.ndarray]] = None,
-        target_index: int = 0,
+        target_idx: int = 0,
         num_restarts: int = 10,
     ) -> None:
         """
@@ -43,7 +43,7 @@ class BaseInfill:
                 Must expose a fitted indicator attribute (``beta`` or ``theta``).
             bounds (Optional[Union[List[float], np.ndarray]]): Design space bounds.
                 shape: (num_features, 2). Required by the default ``propose()``.
-            target_index (int): Output dimension to optimise. Default 0.
+            target_idx (int): Output dimension to optimise. Default 0.
             num_restarts (int): Random restarts for L-BFGS-B in ``propose()``.
                 Default 10.
 
@@ -60,7 +60,7 @@ class BaseInfill:
         else:
             self.bounds = None
 
-        self.target_index = int(target_index)
+        self.target_idx = int(target_idx)
         self.num_restarts = int(num_restarts)
 
     # ------------------------------------------------------------------
