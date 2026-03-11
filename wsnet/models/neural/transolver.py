@@ -1,265 +1,289 @@
-# Transolver: Physics-Attention Neural Operator (grid-free)
+# Transolver: Physics-Attention Neural Operator
 # Author: Shengning Wang
 #
-# Based on: Wu et al., "Transolver: A Fast Transformer Solver for PDEs on General Geometries"
-# ICML 2024. https://github.com/thuml/Transolver
+# Faithful reimplementation of: Wu et al., "Transolver: A Fast Transformer
+# Solver for PDEs on General Geometries", ICML 2024.
+# Source: https://github.com/thuml/Transolver
 #
-# Key idea: replace the P2G -> grid convolution -> G2P pipeline entirely with
-# Physics-Attention — a soft-clustering mechanism that maps N irregular mesh
-# nodes to M learnable "physics slices", performs attention in the slice space,
-# then broadcasts back to N nodes. No regular grid needed.
-#
-# Complexity: O(N*M*C + M^2*C) per layer, where N = nodes, M = slices, C = width.
-# For N >> M, this is much cheaper than direct N^2 attention.
+# This file provides the ORIGINAL Transolver architecture as a baseline
+# for comparison with STMFormer. Uses the irregular mesh variant.
 
 import torch
 from torch import nn, Tensor
-from torch.nn import functional as F
 from tqdm.auto import tqdm
 from typing import List, Optional
 
 
+def _trunc_normal_(tensor: Tensor, std: float = 0.02) -> Tensor:
+    """Truncated normal initialization (compatible replacement for timm).
+
+    Fills tensor in-place from a truncated normal distribution
+    with mean=0 and the given std. Values beyond 2*std are resampled.
+
+    Args:
+        tensor: Tensor to initialize in-place.
+        std: Standard deviation of the normal distribution.
+
+    Returns:
+        The initialized tensor (same object, modified in-place).
+    """
+    with torch.no_grad():
+        tensor.normal_(0, std)
+        # Clamp to [-2*std, 2*std] and resample outliers
+        while True:
+            mask = tensor.abs() > 2 * std
+            if not mask.any():
+                break
+            tensor[mask] = torch.empty_like(tensor[mask]).normal_(0, std)
+    return tensor
+
+
 # ============================================================
-# Spatial Encoder (Random Fourier Features)
+# MLP (with optional residual connections)
 # ============================================================
 
-class SpatialEncoder(nn.Module):
-    """Random Fourier Feature encoding for irregular mesh coordinates.
+class MLP(nn.Module):
+    """Multi-layer perceptron with optional residual connections.
 
-    Encodes spatial coordinates via a fixed random projection:
-        gamma(x) = [sin(2*pi*B*x); cos(2*pi*B*x)]
-    where B ~ N(0, sigma^2) is a non-trainable projection matrix.
+    Architecture:
+        Linear(in) -> act -> [Linear(hidden) -> act (+ residual)] * n_layers -> Linear(out)
 
-    This converts raw (x, y) coordinates into a 2*coord_features-dim
-    representation that captures spatial distances at multiple frequencies,
-    giving Physics-Attention richer geometry context than raw coords.
-
-    The B_matrix is stored as a non-trainable buffer — it is random at init
-    and fixed throughout training. Different random seeds produce different
-    encodings, but the model learns to use whatever encoding it receives.
-
-    Output dim: 2 * coord_features.
+    When res=True, each hidden layer adds its output to its input (pre-activation
+    residual). This matches the original Transolver MLP implementation.
     """
 
-    def __init__(self, spatial_dim: int, coord_features: int = 8, sigma: float = 1.0):
+    def __init__(self, n_input: int, n_hidden: int, n_output: int,
+                 n_layers: int = 1, res: bool = True):
         """
         Args:
-            spatial_dim: Spatial dimensionality of the mesh (2 or 3).
-            coord_features: Half-dimension of the output encoding.
-                            Output shape: (..., 2 * coord_features).
-            sigma: Standard deviation of the random projection matrix.
-                   Controls spatial frequency bandwidth of the encoding.
-                   sigma=1.0 gives ~0.5 cycles across a [-1,1]-normalized domain.
+            n_input: Input feature dimension.
+            n_hidden: Hidden layer dimension.
+            n_output: Output feature dimension.
+            n_layers: Number of hidden residual layers (after the pre-projection).
+            res: Whether to use residual connections in hidden layers.
         """
         super().__init__()
-        self.coord_features = coord_features
-        self.sigma = sigma
-
-        # B_matrix: (spatial_dim, coord_features), fixed non-trainable
-        B = torch.randn(spatial_dim, coord_features) * sigma
-        self.register_buffer('B_matrix', B)  # (spatial_dim, coord_features)
-
-    def forward(self, coords: Tensor) -> Tensor:
-        """Encode coordinates with RFF.
-
-        Args:
-            coords: Node coordinates in [-1, 1]. Shape: (B, N, spatial_dim).
-
-        Returns:
-            RFF encoding. Shape: (B, N, 2 * coord_features).
-        """
-        # proj: (B, N, coord_features)
-        proj = (2.0 * torch.pi) * (coords @ self.B_matrix)
-        return torch.cat([torch.sin(proj), torch.cos(proj)], dim=-1)
-
-
-# ============================================================
-# Sinusoidal Time Encoder
-# ============================================================
-
-class SinusoidalTimeEncoder(nn.Module):
-    """
-    Sinusoidal positional encoding for normalized time t in [0, 1].
-
-    psi(t) = [sin(omega_i * t * max_steps); cos(omega_i * t * max_steps)]
-    Output shape: (B, N, 2 * time_features).
-
-    The 'time_encoder' attribute name is the detection contract with RolloutTrainer.
-    """
-
-    def __init__(self, time_features: int = 4, max_steps: int = 1000):
-        """
-        Args:
-            time_features: Half-dimension of the output embedding.
-            max_steps: Reference max time step for frequency scaling.
-        """
-        super().__init__()
-        self.time_features = time_features
-        self.max_steps = max_steps
-
-        i = torch.arange(time_features, dtype=torch.float32)
-        omega = max_steps ** (-i / max(time_features, 1))
-        self.register_buffer('omega', omega)  # (time_features,)
-
-    def encode_time(self, t_norm: Tensor, N: int) -> Tensor:
-        """
-        Args:
-            t_norm: Normalized frame times in [0, 1]. Shape: (B,).
-            N: Number of nodes for broadcasting.
-
-        Returns:
-            Temporal embedding. Shape: (B, N, 2 * time_features).
-        """
-        scaled_t = t_norm.float() * self.max_steps               # (B,)
-        angles = self.omega.unsqueeze(0) * scaled_t.unsqueeze(1)  # (B, time_features)
-        emb = torch.cat([torch.sin(angles), torch.cos(angles)], dim=-1)  # (B, 2*time_features)
-        return emb.unsqueeze(1).expand(-1, N, -1)                 # (B, N, 2*time_features)
-
-
-# ============================================================
-# Physics-Attention
-# ============================================================
-
-class PhysicsAttention(nn.Module):
-    """
-    Physics-Attention: the core operator of Transolver.
-
-    Maps N irregular mesh nodes to M physics slices via learned soft assignments,
-    performs multi-head self-attention among the M slice tokens, then broadcasts
-    back to N nodes. This replaces the P2G -> spectral conv -> G2P pipeline with
-    a single differentiable operator.
-
-    Algorithm (for one sample):
-        w_{n,m}  = Softmax_m( Linear_slice(x_n) )        (B, N, M)   soft assignment
-        z_m      = sum_n w_{n,m} * x_n / sum_n w_{n,m}   (B, M, C)   aggregate slices
-        z'_m     = MHA(z, z, z)                           (B, M, C)   inter-slice attention
-        x'_n     = sum_m w_{n,m} * z'_m                  (B, N, C)   broadcast back
-
-    Complexity: O(B * N * M * C) for slice aggregation + O(B * M^2 * C) for attention.
-    For N >> M, dominated by the O(N*M) terms — linear in N.
-    """
-
-    def __init__(self, width: int, num_slices: int, num_heads: int):
-        """
-        Args:
-            width: Feature dimension (must be divisible by num_heads).
-            num_slices: Number of physics slice tokens (M). Typically 32-64.
-            num_heads: Number of attention heads for MHA among slice tokens.
-        """
-        super().__init__()
-        assert width % num_heads == 0, \
-            f'width={width} must be divisible by num_heads={num_heads}'
-
-        # Projects node features to M soft slice weights
-        self.slice_proj = nn.Linear(width, num_slices)
-
-        # Multi-head self-attention among M slice tokens
-        self.attn = nn.MultiheadAttention(
-            embed_dim=width, num_heads=num_heads, batch_first=True
-        )
-
-        self.num_slices = num_slices
+        self.n_layers = n_layers
+        self.res = res
+        self.linear_pre = nn.Sequential(nn.Linear(n_input, n_hidden), nn.GELU())
+        self.linear_post = nn.Linear(n_hidden, n_output)
+        self.linears = nn.ModuleList([
+            nn.Sequential(nn.Linear(n_hidden, n_hidden), nn.GELU())
+            for _ in range(n_layers)
+        ])
 
     def forward(self, x: Tensor) -> Tensor:
         """
         Args:
-            x: Node features. Shape: (B, N, width).
+            x: Input tensor. Shape: (..., n_input).
 
         Returns:
-            Updated node features. Shape: (B, N, width).
+            Output tensor. Shape: (..., n_output).
         """
-        B, N, C = x.shape
-
-        # 1. Soft slice assignment: (B, N, M)
-        w = F.softmax(self.slice_proj(x), dim=-1)  # (B, N, M)
-
-        # 2. Aggregate physics tokens: z_m = sum_n w_{n,m} * x_n / sum_n w_{n,m}
-        #    w.transpose(1,2): (B, M, N); x: (B, N, C) -> matmul -> (B, M, C)
-        w_sum = w.sum(dim=1, keepdim=True).transpose(1, 2).clamp(min=1e-8)  # (B, M, 1)
-        z = torch.bmm(w.transpose(1, 2), x) / w_sum  # (B, M, C)
-
-        # 3. Inter-slice attention: (B, M, C) -> (B, M, C)
-        z_prime, _ = self.attn(z, z, z)  # (B, M, C)
-
-        # 4. Broadcast back to nodes: x'_n = sum_m w_{n,m} * z'_m
-        #    w: (B, N, M); z_prime: (B, M, C) -> (B, N, C)
-        x_prime = torch.bmm(w, z_prime)  # (B, N, C)
-
-        return x_prime
-
-
-# ============================================================
-# Transolver Block  (Physics-Attention + FFN, pre-norm)
-# ============================================================
-
-class TransolverBlock(nn.Module):
-    """
-    Single Transolver layer: pre-norm Physics-Attention + pre-norm FFN.
-
-    y = x + PhysicsAttention(LayerNorm(x))
-    z = y + FFN(LayerNorm(y))
-    """
-
-    def __init__(self, width: int, num_slices: int, num_heads: int, ffn_dim: int):
-        """
-        Args:
-            width: Feature dimension.
-            num_slices: Number of physics slice tokens.
-            num_heads: Attention heads for slice-space MHA.
-            ffn_dim: Inner dimension of the feedforward network.
-        """
-        super().__init__()
-        self.norm1 = nn.LayerNorm(width)
-        self.phys_attn = PhysicsAttention(width, num_slices, num_heads)
-        self.norm2 = nn.LayerNorm(width)
-        self.ffn = nn.Sequential(
-            nn.Linear(width, ffn_dim),
-            nn.GELU(),
-            nn.Linear(ffn_dim, width),
-        )
-
-    def forward(self, x: Tensor) -> Tensor:
-        """
-        Args:
-            x: Node features. Shape: (B, N, width).
-
-        Returns:
-            Updated node features. Shape: (B, N, width).
-        """
-        x = x + self.phys_attn(self.norm1(x))
-        x = x + self.ffn(self.norm2(x))
+        x = self.linear_pre(x)
+        for i in range(self.n_layers):
+            if self.res:
+                x = self.linears[i](x) + x
+            else:
+                x = self.linears[i](x)
+        x = self.linear_post(x)
         return x
 
 
 # ============================================================
-# Transolver Network
+# Physics Attention (Irregular Mesh)
+# ============================================================
+
+class PhysicsAttention(nn.Module):
+    """Physics-aware slice attention for irregular meshes.
+
+    The mechanism has three stages:
+        1. **Slice**: Soft-cluster N mesh nodes into G slice tokens via learned
+           coordinate-based weights. Features and coordinates are projected
+           separately (in_project_fx, in_project_x), then the coordinate
+           projection drives the slicing weights through a temperature-scaled
+           softmax.
+        2. **Attend**: Standard multi-head self-attention among the G slice
+           tokens (Q/K/V projections, scaled dot-product).
+        3. **Deslice**: Broadcast attended slice tokens back to N nodes using
+           the same slicing weights.
+
+    Complexity: O(N * G * D + G^2 * D) per head, where N = nodes, G = slices,
+    D = dim_head. For N >> G this is much cheaper than O(N^2 * D).
+
+    Args:
+        dim: Model hidden dimension (input and output).
+        num_heads: Number of attention heads.
+        dim_head: Dimension per head. inner_dim = num_heads * dim_head.
+        dropout: Dropout probability on attention weights and output.
+        num_slices: Number of physics-informed slice tokens (G).
+    """
+
+    def __init__(self, dim: int, num_heads: int = 8, dim_head: int = 64,
+                 dropout: float = 0.0, num_slices: int = 64):
+        super().__init__()
+        inner_dim = dim_head * num_heads
+        self.dim_head = dim_head
+        self.num_heads = num_heads
+        self.scale = dim_head ** -0.5
+        self.softmax = nn.Softmax(dim=-1)
+        self.dropout = nn.Dropout(dropout)
+
+        # Learnable temperature parameter, clamped to [0.1, 5] during forward
+        self.temperature = nn.Parameter(torch.ones(1, num_heads, 1, 1) * 0.5)
+
+        # Separate projections for features and coordinates
+        self.in_project_x = nn.Linear(dim, inner_dim)
+        self.in_project_fx = nn.Linear(dim, inner_dim)
+
+        # Slice projection: maps each head's dim_head -> num_slices
+        self.in_project_slice = nn.Linear(dim_head, num_slices)
+        nn.init.orthogonal_(self.in_project_slice.weight)
+
+        # Q / K / V projections on slice tokens
+        self.to_q = nn.Linear(dim_head, dim_head, bias=False)
+        self.to_k = nn.Linear(dim_head, dim_head, bias=False)
+        self.to_v = nn.Linear(dim_head, dim_head, bias=False)
+
+        # Output projection
+        self.to_out = nn.Sequential(
+            nn.Linear(inner_dim, dim),
+            nn.Dropout(dropout),
+        )
+
+    def forward(self, x: Tensor) -> Tensor:
+        """Apply physics-attention to irregular mesh features.
+
+        Args:
+            x: Node features. Shape: (B, N, C) where C = dim.
+
+        Returns:
+            Attended features. Shape: (B, N, C).
+        """
+        B, N, C = x.shape
+        H, D = self.num_heads, self.dim_head
+
+        # --- (1) Slice: soft-cluster N nodes into G slice tokens ---
+        # Feature projection -> (B, H, N, D)
+        fx_mid = self.in_project_fx(x).reshape(B, N, H, D).permute(0, 2, 1, 3).contiguous()
+        # Coordinate projection -> (B, H, N, D)
+        x_mid = self.in_project_x(x).reshape(B, N, H, D).permute(0, 2, 1, 3).contiguous()
+
+        # Slice weights: (B, H, N, G), temperature-scaled softmax
+        temp = torch.clamp(self.temperature, min=0.1, max=5.0)
+        slice_weights = self.softmax(self.in_project_slice(x_mid) / temp)  # (B, H, N, G)
+
+        # Weighted aggregation: (B, H, G, D)
+        slice_norm = slice_weights.sum(dim=2)  # (B, H, G)
+        slice_token = torch.einsum("bhnc,bhng->bhgc", fx_mid, slice_weights)
+        slice_token = slice_token / (slice_norm.unsqueeze(-1) + 1e-5)
+
+        # --- (2) Attention among slice tokens ---
+        q = self.to_q(slice_token)  # (B, H, G, D)
+        k = self.to_k(slice_token)
+        v = self.to_v(slice_token)
+
+        dots = torch.matmul(q, k.transpose(-1, -2)) * self.scale  # (B, H, G, G)
+        attn = self.softmax(dots)
+        attn = self.dropout(attn)
+        out_slice = torch.matmul(attn, v)  # (B, H, G, D)
+
+        # --- (3) Deslice: broadcast back to N nodes ---
+        out_x = torch.einsum("bhgc,bhng->bhnc", out_slice, slice_weights)  # (B, H, N, D)
+        out_x = out_x.permute(0, 2, 1, 3).reshape(B, N, H * D)  # (B, N, inner_dim)
+        return self.to_out(out_x)
+
+
+# ============================================================
+# Transolver Block
+# ============================================================
+
+class TransolverBlock(nn.Module):
+    """Single Transolver encoder block.
+
+    Architecture:
+        x -> LayerNorm -> PhysicsAttention -> (+residual)
+          -> LayerNorm -> MLP              -> (+residual)
+        [if last_layer: -> LayerNorm -> Linear(out_channels)]
+
+    The MLP uses 0 hidden residual layers (just pre-linear + GELU + post-linear),
+    matching the original implementation (n_layers=0, res=False).
+
+    Args:
+        num_heads: Number of attention heads.
+        hidden_dim: Model width (hidden dimension).
+        dropout: Dropout probability.
+        mlp_ratio: MLP hidden dimension multiplier.
+        last_layer: If True, append a final LayerNorm + Linear output head.
+        out_channels: Output dimension for the last layer projection.
+        num_slices: Number of physics-informed slice tokens.
+    """
+
+    def __init__(self, num_heads: int, hidden_dim: int, dropout: float,
+                 mlp_ratio: int = 4, last_layer: bool = False,
+                 out_channels: int = 1, num_slices: int = 32):
+        super().__init__()
+        self.last_layer = last_layer
+
+        self.ln_1 = nn.LayerNorm(hidden_dim)
+        self.attn = PhysicsAttention(
+            dim=hidden_dim,
+            num_heads=num_heads,
+            dim_head=hidden_dim // num_heads,
+            dropout=dropout,
+            num_slices=num_slices,
+        )
+
+        self.ln_2 = nn.LayerNorm(hidden_dim)
+        self.mlp = MLP(hidden_dim, hidden_dim * mlp_ratio, hidden_dim,
+                        n_layers=0, res=False)
+
+        if self.last_layer:
+            self.ln_3 = nn.LayerNorm(hidden_dim)
+            self.out_proj = nn.Linear(hidden_dim, out_channels)
+
+    def forward(self, fx: Tensor) -> Tensor:
+        """
+        Args:
+            fx: Node features. Shape: (B, N, hidden_dim).
+
+        Returns:
+            If last_layer: output predictions. Shape: (B, N, out_channels).
+            Otherwise: updated features. Shape: (B, N, hidden_dim).
+        """
+        fx = self.attn(self.ln_1(fx)) + fx
+        fx = self.mlp(self.ln_2(fx)) + fx
+        if self.last_layer:
+            return self.out_proj(self.ln_3(fx))
+        return fx
+
+
+# ============================================================
+# Transolver (Irregular Mesh Variant)
 # ============================================================
 
 class Transolver(nn.Module):
-    """
-    Transolver: grid-free neural operator via Physics-Attention.
+    """Transolver: A Fast Transformer Solver for PDEs on General Geometries.
 
-    Eliminates the P2G -> spectral conv -> G2P interpolation pipeline entirely.
-    Instead, a soft-clustering attention mechanism aggregates N irregular mesh
-    nodes into M learnable physics slice tokens, performs attention in that
-    compressed space, then broadcasts back to N nodes. No regular grid needed
-    -> no grid interpolation errors, no scatter-mean dissipation.
+    This is the irregular mesh variant (no convolution layers). The pipeline is:
+        1. Concatenate input_features and physical_coords -> (B, N, in_channels + spatial_dim)
+        2. MLP preprocessing: project to hidden width
+        3. Add learnable placeholder bias
+        4. Pass through a stack of TransolverBlocks (last block produces output)
 
-    Spatio-Temporal Positional Encoding:
-        - Spatial: RFF encoding gamma(x) = [sin(2*pi*B*x); cos(2*pi*B*x)]
-                   with B ~ N(0, sigma^2), non-trainable. Captures relative
-                   spatial distances at multiple frequencies.
-        - Temporal: Sinusoidal PE psi(t) = [sin(omega_i*t); cos(omega_i*t)]
-                    with omega_i = max_steps^(-i/time_features), t in [0,1].
+    Complexity per layer: O(N * G * C + G^2 * C), where N = nodes,
+    G = num_slices, C = width. Total: O(depth * (N * G * C + G^2 * C)).
 
-    Architecture:
-        Embed:  cat([node_features, rff(coords), time_emb]) -> Linear -> width
-        Layers: L x TransolverBlock (PhysicsAttention + LayerNorm + FFN)
-        Output: Linear(width -> out_channels)
-
-    Embed input dim: in_channels + 2*coord_features + 2*time_features
-    Complexity per layer: O(N*M*C + M^2*C), linear in N for M << N.
-    Reference: Wu et al., ICML 2024. https://github.com/thuml/Transolver
+    Args:
+        in_channels: Number of input feature channels per node.
+        out_channels: Number of output channels per node.
+        spatial_dim: Spatial dimensionality of the mesh (1, 2, or 3).
+        width: Hidden dimension throughout the transformer.
+        depth: Number of TransolverBlocks.
+        num_slices: Number of physics-informed slice tokens per attention layer.
+        num_heads: Number of attention heads.
+        mlp_ratio: MLP hidden dimension multiplier within each block.
+        dropout: Dropout probability.
     """
 
     def __init__(
@@ -271,126 +295,108 @@ class Transolver(nn.Module):
         depth: int = 8,
         num_slices: int = 32,
         num_heads: int = 8,
-        ffn_dim: Optional[int] = None,
-        time_features: int = 4,
-        max_steps: int = 1000,
-        coord_features: int = 8,
-        coord_sigma: float = 1.0,
+        mlp_ratio: int = 1,
+        dropout: float = 0.0,
     ):
-        """
-        Args:
-            in_channels: Number of input feature channels (e.g., 4 for [Vx, Vy, P, T]).
-            out_channels: Number of output feature channels.
-            spatial_dim: Spatial dimension of the mesh (2 or 3).
-            width: Hidden channel dimension. Must be divisible by num_heads.
-            depth: Number of TransolverBlock layers.
-            num_slices: Number of physics slice tokens (M). Default 32.
-            num_heads: Attention heads for slice-space MHA. Default 8.
-            ffn_dim: Inner FFN dimension. Defaults to 4 * width.
-            time_features: Sinusoidal PE half-dimension (output: 2*time_features dims).
-            max_steps: Reference max time step for sinusoidal frequency scaling.
-            coord_features: RFF spatial encoding half-dim (output: 2*coord_features).
-                            Set 0 to use raw coordinates instead of RFF encoding.
-            coord_sigma: RFF projection scale (std of B_matrix). Controls spatial
-                         frequency bandwidth of the spatial encoding.
-
-        Raises:
-            AssertionError: If width is not divisible by num_heads.
-        """
         super().__init__()
-
-        assert width % num_heads == 0, \
-            f'width={width} must be divisible by num_heads={num_heads}'
-
+        self.in_channels = in_channels
+        self.out_channels = out_channels
         self.spatial_dim = spatial_dim
-        self.coord_features = coord_features
-        if ffn_dim is None:
-            ffn_dim = 4 * width
+        self.width = width
+        self.depth = depth
 
-        # Temporal encoder — 'time_encoder' attribute detected by RolloutTrainer
-        self.time_encoder = SinusoidalTimeEncoder(
-            time_features=time_features,
-            max_steps=max_steps,
+        # Preprocessing MLP: raw (features || coords) -> hidden width
+        # 2-layer MLP with residual: Linear -> GELU -> [Linear -> GELU + res] -> Linear
+        self.preprocess = MLP(
+            in_channels + spatial_dim,
+            width * 2,
+            width,
+            n_layers=0,
+            res=False,
         )
 
-        # Spatial encoder (RFF) — optional; coord_features=0 falls back to raw coords
-        if coord_features > 0:
-            self.spatial_encoder = SpatialEncoder(
-                spatial_dim=spatial_dim,
-                coord_features=coord_features,
-                sigma=coord_sigma,
+        # Learnable placeholder bias added to all node features after preprocessing
+        self.placeholder = nn.Parameter(
+            (1.0 / width) * torch.rand(width, dtype=torch.float)
+        )
+
+        # Stack of TransolverBlocks; the last block includes output projection
+        self.blocks = nn.ModuleList([
+            TransolverBlock(
+                num_heads=num_heads,
+                hidden_dim=width,
+                dropout=dropout,
+                mlp_ratio=mlp_ratio,
+                out_channels=out_channels,
+                num_slices=num_slices,
+                last_layer=(i == depth - 1),
             )
-            coord_dim = 2 * coord_features
-        else:
-            self.spatial_encoder = None
-            coord_dim = spatial_dim
-
-        # Input embedding: [features + coord_enc + time_emb] -> width
-        embed_in = in_channels + coord_dim + 2 * time_features
-        self.embed = nn.Linear(embed_in, width)
-
-        # Transolver blocks
-        self.layers = nn.ModuleList([
-            TransolverBlock(width, num_slices, num_heads, ffn_dim)
-            for _ in range(depth)
+            for i in range(depth)
         ])
 
-        # Output projection
-        self.proj = nn.Linear(width, out_channels)
+        # Weight initialization
+        self._initialize_weights()
 
-    # ------------------------------------------------------------------
-    # Forward Pass
-    # ------------------------------------------------------------------
+    def _initialize_weights(self) -> None:
+        """Apply truncated normal init to Linear layers, constant init to LayerNorm."""
+        self.apply(self._init_weights)
 
-    def forward(self, input_features: Tensor, physical_coords: Tensor,
-                t_norm: Optional[Tensor] = None, **kwargs) -> Tensor:
+    @staticmethod
+    def _init_weights(m: nn.Module) -> None:
+        """Per-module weight initialization callback.
+
+        - Linear: trunc_normal_(weight, std=0.02), zeros_(bias).
+        - LayerNorm / BatchNorm1d: ones_(weight), zeros_(bias).
         """
-        Transolver forward pass. No P2G/G2P — operates directly on mesh nodes.
+        if isinstance(m, nn.Linear):
+            _trunc_normal_(m.weight, std=0.02)
+            if m.bias is not None:
+                nn.init.constant_(m.bias, 0)
+        elif isinstance(m, (nn.LayerNorm, nn.BatchNorm1d)):
+            nn.init.constant_(m.bias, 0)
+            nn.init.constant_(m.weight, 1.0)
+
+    def forward(
+        self,
+        input_features: Tensor,
+        physical_coords: Tensor,
+        t_norm: Optional[Tensor] = None,
+        **kwargs,
+    ) -> Tensor:
+        """Forward pass for single-step prediction.
 
         Args:
-            input_features: Node feature fields at time t.
-                            Shape: (B, N, in_channels).
-            physical_coords: Normalized node coordinates in [-1, 1].
-                             Shape: (B, N, spatial_dim).
-            t_norm: Normalized frame times in [0, 1]. Shape: (B,).
-                    If None, defaults to zeros.
-            **kwargs: Accepts (and ignores) latent_coords for API compatibility
-                      with GeoFNO.
+            input_features: Per-node input features.
+                Shape: (B, N, in_channels).
+            physical_coords: Node spatial coordinates.
+                Shape: (B, N, spatial_dim).
+            t_norm: Normalized time step (unused in the original Transolver,
+                accepted for interface compatibility). Shape: (B,).
+            **kwargs: Additional keyword arguments (ignored).
 
         Returns:
-            Predicted node features at time t+1. Shape: (B, N, out_channels).
+            Per-node output predictions. Shape: (B, N, out_channels).
         """
-        B, N, _ = physical_coords.shape
+        # Concatenate features and coordinates, then project
+        fx = torch.cat([physical_coords, input_features], dim=-1)  # (B, N, in_channels + spatial_dim)
+        fx = self.preprocess(fx)  # (B, N, width)
 
-        if t_norm is None:
-            t_norm = torch.zeros(B, device=physical_coords.device)
+        # Add learnable placeholder bias
+        fx = fx + self.placeholder[None, None, :]  # broadcast (1, 1, width)
 
-        # Spatial encoding: RFF or raw coords
-        if self.spatial_encoder is not None:
-            coord_enc = self.spatial_encoder(physical_coords)  # (B, N, 2*coord_features)
-        else:
-            coord_enc = physical_coords  # (B, N, spatial_dim)
+        # Pass through transformer blocks
+        for block in self.blocks:
+            fx = block(fx)
 
-        # Temporal encoding: t_norm -> (B, N, 2*time_features)
-        time_emb = self.time_encoder.encode_time(t_norm, N)
-
-        # Embedding: cat([features, coord_enc, time_emb]) -> hidden
-        x = self.embed(torch.cat([input_features, coord_enc, time_emb], dim=-1))
-
-        # Transolver blocks
-        for layer in self.layers:
-            x = layer(x)
-
-        # Output projection
-        return self.proj(x)  # (B, N, out_channels)
-
-    # ------------------------------------------------------------------
-    # Autoregressive Inference
-    # ------------------------------------------------------------------
+        return fx  # (B, N, out_channels)
 
     def predict(self, initial_state: Tensor, coords: Tensor, steps: int) -> Tensor:
-        """
-        Autoregressive inference for time-dependent PDE rollout.
+        """Autoregressive inference for time-dependent PDE rollout.
+
+        Iteratively applies the model for `steps` time steps, feeding each
+        prediction as the input to the next step. The normalized time t_norm
+        is passed for interface compatibility but is not used internally by
+        the original Transolver architecture.
 
         Note: caller must call model.eval() before invoking this method.
 

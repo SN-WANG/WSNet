@@ -1,4 +1,4 @@
-# Main Script for Autoregressive Hyper Flow Net Training and Inference
+# Main Script for Flow Simulation: Training, Inference, and Baseline Comparison
 # Author: Shengning Wang
 
 import os
@@ -19,13 +19,19 @@ if project_root not in sys.path: sys.path.insert(0, project_root)
 
 
 from wsnet.models.neural.geofno import GeoFNO
+from wsnet.models.neural.stmformer import STMFormer
 from wsnet.models.neural.transolver import Transolver
 
 from wsnet.data.flow_data import FlowData
 from wsnet.data.flow_vis import FlowVis
+from wsnet.data.flow_plot import (
+    plot_training_curves, plot_rollout_error,
+    plot_error_heatmap, plot_metrics_comparison,
+)
 from wsnet.data.scaler import StandardScalerTensor, MinMaxScalerTensor
 
 from wsnet.training.rollout_trainer import RolloutTrainer
+from wsnet.training.teacher_forcing_trainer import TeacherForcingTrainer
 from wsnet.training.base_criterion import Metrics, NMSECriterion
 
 from wsnet.utils.seeder import seed_everything
@@ -37,13 +43,12 @@ from wsnet.utils.hue_logger import hue, logger
 # ======================================================================
 
 class ScaledCFDataset(Dataset):
-    """
-    Wraps FlowData to apply feature standardization and coordinate normalization.
+    """Wraps FlowData to apply feature standardization and coordinate normalization.
 
     Attributes:
-        dataset:              The underlying raw dataset.
-        feature_scaler:       Fitted StandardScalerTensor.
-        coord_scaler:         Fitted MinMaxScalerTensor.
+        dataset: The underlying raw dataset.
+        feature_scaler: Fitted StandardScalerTensor.
+        coord_scaler: Fitted MinMaxScalerTensor.
     """
     def __init__(
             self, dataset: FlowData,
@@ -59,63 +64,129 @@ class ScaledCFDataset(Dataset):
 
     def __getitem__(self, idx: int) -> Tuple[Tensor, Tensor, float, float]:
         seq, coords, start_t_norm, dt_norm = self.dataset[idx]
-
-        # Feature standardization (Mean/Std)
         seq_std = self.feature_scaler.transform(seq)
-
-        # Coordinate normalization (Min/Max -> [-1, 1])
         coords_norm = self.coord_scaler.transform(coords)
-
         return seq_std, coords_norm, start_t_norm, dt_norm
 
 
 # ======================================================================
-# Model factory
+# 2. Model Factory
 # ======================================================================
 
 def _build_model(args: argparse.Namespace) -> torch.nn.Module:
-    """Instantiate the model selected by --model_type."""
-    in_ch = out_ch = args.spatial_dim + 2  # [Vx, Vy, (Vz,) P, T]
-    deform_kw = {"num_layers": args.deform_layers, "hidden_dim": args.deform_hidden}
+    """Instantiate the model selected by --model_type.
 
-    if args.model_type == "geofno":
+    Args:
+        args: Parsed command-line arguments.
+
+    Returns:
+        Initialized neural operator model.
+
+    Raises:
+        ValueError: If model_type is not recognized.
+    """
+    in_ch = out_ch = args.spatial_dim + 2  # [Vx, Vy, (Vz,) P, T]
+
+    if args.model_type == "stmformer":
+        return STMFormer(
+            in_channels=in_ch, out_channels=out_ch,
+            spatial_dim=args.spatial_dim,
+            width=args.width, depth=args.depth,
+            num_slices=args.num_slices, num_heads=args.num_heads,
+            # Ablation switches
+            use_spatial_encoding=args.use_spatial_encoding,
+            use_temporal_encoding=args.use_temporal_encoding,
+            use_boundary_padding=args.use_boundary_padding,
+            # Encoding params
+            coord_features=args.coord_features, coord_sigma=args.coord_sigma,
+            time_features=args.time_features, max_steps=args.max_steps,
+            padding_ratio=args.padding_ratio,
+        )
+
+    elif args.model_type == "geofno":
+        deform_kw = {"num_layers": args.deform_layers, "hidden_dim": args.deform_hidden}
         return GeoFNO(
             in_channels=in_ch, out_channels=out_ch,
             modes=args.modes, latent_grid_size=args.latent_grid_size,
             depth=args.depth, width=args.width,
             deformation_kwargs=deform_kw,
         )
+
     elif args.model_type == "transolver":
         return Transolver(
             in_channels=in_ch, out_channels=out_ch,
             spatial_dim=args.spatial_dim,
             width=args.width, depth=args.depth,
-            num_slices=args.num_slices,
-            time_features=args.time_features,
-            max_steps=args.max_steps,
-            coord_features=args.coord_features,
-            coord_sigma=args.coord_sigma,
+            num_slices=args.tsv_num_slices, num_heads=args.tsv_num_heads,
+            mlp_ratio=args.mlp_ratio, dropout=args.dropout,
         )
+
     else:
-        raise ValueError(f"Unknown model_type '{args.model_type}'. Choices: geofno, transolver")
+        raise ValueError(
+            f"Unknown model_type '{args.model_type}'. "
+            f"Choices: stmformer, geofno, transolver"
+        )
 
 
 # ======================================================================
-# 2. Training Pipeline
+# 3. Trainer Factory
+# ======================================================================
+
+def _build_trainer(args: argparse.Namespace, model: torch.nn.Module,
+                   scalers: Dict, output_dir: Path):
+    """Instantiate the trainer selected by --trainer_type.
+
+    Args:
+        args: Parsed command-line arguments.
+        model: The model to train.
+        scalers: Dictionary of data scalers for checkpoint saving.
+        output_dir: Directory for saving artifacts.
+
+    Returns:
+        Configured trainer instance.
+
+    Raises:
+        ValueError: If trainer_type is not recognized.
+    """
+    if args.trainer_type == "rollout":
+        return RolloutTrainer(
+            model=model, lr=args.lr, max_epochs=args.max_epochs,
+            scalers=scalers, output_dir=output_dir, device=args.device,
+            weight_decay=args.weight_decay, eta_min=args.eta_min,
+            max_rollout_steps=args.max_rollout_steps,
+            rollout_patience=args.rollout_patience,
+            noise_std_init=args.noise_std_init, noise_decay=args.noise_decay,
+        )
+
+    elif args.trainer_type == "teacher_forcing":
+        return TeacherForcingTrainer(
+            model=model, lr=args.lr, max_epochs=args.max_epochs,
+            scalers=scalers, output_dir=output_dir, device=args.device,
+            weight_decay=args.weight_decay, eta_min=args.eta_min,
+        )
+
+    else:
+        raise ValueError(
+            f"Unknown trainer_type '{args.trainer_type}'. "
+            f"Choices: rollout, teacher_forcing"
+        )
+
+
+# ======================================================================
+# 4. Training Pipeline
 # ======================================================================
 
 def train_pipeline(args: argparse.Namespace) -> None:
-    """
-    Executes the training workflow: Data loading -> Data Scaling -> Model Init ->  Model Training.
+    """Execute the training workflow: data loading -> scaling -> model init -> training.
 
     Args:
-        args (argparse.Namespace): Parsed command line arguments.
+        args: Parsed command-line arguments.
     """
     seed_everything(args.seed)
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    # --- 1. Data Preparation ---
+    # --- Data Preparation ---
     logger.info("initializing datasets...")
     train_raw, val_raw, _ = FlowData.spawn(
         data_dir=args.data_dir, spatial_dim=args.spatial_dim,
@@ -136,38 +207,28 @@ def train_pipeline(args: argparse.Namespace) -> None:
     val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False,
                             num_workers=args.num_workers, pin_memory=True)
 
-    # --- 2. Model Initialization ---
-    logger.info(f"instantiating model: {hue.b}{args.model_type}{hue.q}...")
+    # --- Model Initialization ---
+    logger.info(f"instantiating model: {hue.b}{args.model_type}{hue.q} "
+                f"with trainer: {hue.b}{args.trainer_type}{hue.q}...")
     model = _build_model(args)
 
     num_params = sum(p.numel() for p in model.parameters())
     logger.info(f"model has {hue.m}{num_params}{hue.q} parameters")
 
-    # --- 3. Training Execution ---
-    trainer = RolloutTrainer(
-        # base params
-        model=model, lr=args.lr, max_epochs=args.max_epochs,
-        scalers=scalers, output_dir=output_dir, device=args.device,
-        # optimization params
-        weight_decay=args.weight_decay, eta_min=args.eta_min,
-        # curriculum params
-        max_rollout_steps=args.max_rollout_steps, rollout_patience=args.rollout_patience,
-        noise_std_init=args.noise_std_init, noise_decay=args.noise_decay,
-    )
-
+    # --- Training ---
+    trainer = _build_trainer(args, model, scalers, output_dir)
     trainer.fit(train_loader, val_loader)
 
 
 # ======================================================================
-# 3. Inference Pipeline
+# 5. Inference Pipeline
 # ======================================================================
 
 def inference_pipeline(args: argparse.Namespace) -> None:
-    """
-    Executes the testing workflow using artifacts from the training phase.
+    """Execute the inference workflow using artifacts from the training phase.
 
     Args:
-        args (argparse.Namespace): Parsed command line arguments.
+        args: Parsed command-line arguments.
     """
     device = torch.device(args.device)
     run_dir = Path(args.output_dir)
@@ -176,7 +237,7 @@ def inference_pipeline(args: argparse.Namespace) -> None:
     if not model_path.exists():
         raise FileNotFoundError(f"ckpt.pt not found at {model_path}.")
 
-    # --- 1. Restore State ---
+    # --- Restore State ---
     logger.info("loading training artifacts...")
     checkpoint = torch.load(model_path, map_location=device, weights_only=True)
 
@@ -185,7 +246,7 @@ def inference_pipeline(args: argparse.Namespace) -> None:
     coord_scaler = MinMaxScalerTensor(norm_range="bipolar")
     coord_scaler.load_state_dict(checkpoint["scaler_state_dict"]["coord_scaler"])
 
-    # --- 2. Data Preparation ---
+    # --- Data Preparation ---
     _, _, test_raw = FlowData.spawn(
         data_dir=args.data_dir, spatial_dim=args.spatial_dim,
         win_len=args.win_len, win_stride=args.win_stride,
@@ -196,17 +257,17 @@ def inference_pipeline(args: argparse.Namespace) -> None:
     )
     test_loader = DataLoader(test_dataset, batch_size=1, shuffle=False)
 
-    # --- 3. Model Restoration ---
+    # --- Model Restoration ---
     model = _build_model(args)
 
     num_params = sum(p.numel() for p in model.parameters())
-    logger.info(f"Model has {hue.m}{num_params}{hue.q} parameters")
+    logger.info(f"model has {hue.m}{num_params}{hue.q} parameters")
 
     model.load_state_dict(checkpoint["model_state_dict"])
     model.to(device)
     model.eval()
 
-    # --- 4. Inference and Analysis ---
+    # --- Inference ---
     logger.info(f'{hue.g}running inference on test set...{hue.q}')
     visualizer = FlowVis(output_dir=run_dir, spatial_dim=args.spatial_dim)
 
@@ -217,23 +278,15 @@ def inference_pipeline(args: argparse.Namespace) -> None:
             seq_std = seq_std.to(device)
             coords_norm = coords_norm.to(device)
 
-            # ------------------------------------------------------------------
-
             case_name = test_raw.case_names[i]
             steps = seq_std.shape[1] - 1
             initial_state = seq_std[:, 0]
             coords_raw = test_raw.coords[i].cpu()
 
-            # ------------------------------------------------------------------
-
             pred_seq_std = model.predict(initial_state, coords_norm, steps)
-
-            # ------------------------------------------------------------------
 
             pred_seq = feature_scaler.inverse_transform(pred_seq_std).cpu().squeeze(0)
             gt_seq = feature_scaler.inverse_transform(seq_std).cpu().squeeze(0)
-
-            # ------------------------------------------------------------------
 
             metrics_evaluator = Metrics(channel_names=args.channel_names)
             metrics = metrics_evaluator.compute(pred_seq, gt_seq)
@@ -243,44 +296,71 @@ def inference_pipeline(args: argparse.Namespace) -> None:
             for ch in args.channel_names:
                 nmse = metrics[ch]["global"]["nmse"]
                 r2 = metrics[ch]["global"]["r2"]
-                log_metrics.append(f"{hue.c}{ch}:{hue.q} NMSE={hue.m}{nmse:.2e}{hue.q}, R2={hue.m}{r2:.4f}{hue.q}")
+                log_metrics.append(
+                    f"{hue.c}{ch}:{hue.q} NMSE={hue.m}{nmse:.2e}{hue.q}, R2={hue.m}{r2:.4f}{hue.q}"
+                )
 
             logger.info(f"case {hue.b}{case_name}{hue.q} | " + " | ".join(log_metrics))
 
-            # ------------------------------------------------------------------
-
             torch.save(pred_seq, run_dir / f"{case_name}_pred.pt")
-
-            # ------------------------------------------------------------------
 
             logger.info(f"rendering animation for case: {hue.b}{case_name}{hue.q}")
             visualizer.animate_comparison(
                 gt=gt_seq, pred=pred_seq, coords=coords_raw, case_name=case_name)
 
+            # --- Per-case static paper figures ---
+            logger.info(f"generating paper figures for case: {hue.b}{case_name}{hue.q}")
+            plot_rollout_error(
+                pred=pred_seq, gt=gt_seq,
+                channel_names=args.channel_names,
+                output_path=str(run_dir / f"{case_name}_rollout_error.png"),
+            )
+
+            n_steps = pred_seq.shape[0]
+            for t_idx, t_label in [(0, "first"), (n_steps // 2, "mid"), (n_steps - 1, "last")]:
+                plot_error_heatmap(
+                    gt=gt_seq, pred=pred_seq, coords=coords_raw,
+                    timestep=t_idx, channel_names=args.channel_names,
+                    output_path=str(run_dir / f"{case_name}_error_t{t_idx}_{t_label}.png"),
+                )
 
     with open(run_dir / "test_metrics.json", "w") as f:
         json.dump(case_metrics, f, indent=4)
 
-    logger.info(f"{hue.g}inference completed.{hue.q}")
+    # --- Post-inference aggregated plots ---
+    history_path = run_dir / "history.json"
+    if history_path.exists():
+        plot_training_curves(
+            history_paths={args.model_type: str(history_path)},
+            output_path=str(run_dir / "training_curve.png"),
+        )
+
+    plot_metrics_comparison(
+        metrics_paths={args.model_type: str(run_dir / "test_metrics.json")},
+        output_path=str(run_dir / "metrics_comparison.png"),
+    )
+
+    logger.info(f"{hue.g}inference and paper figures completed.{hue.q}")
 
 
 # ======================================================================
-# 4. Probe Pipeline (OOM pre-flight check)
+# 6. Probe Pipeline (OOM Pre-Flight Check)
 # ======================================================================
 
 def probe_pipeline(args: argparse.Namespace) -> None:
-    """
-    Run one full-rollout training step on real training data to check peak VRAM usage.
-    Loads and augments the training split (identical to train_pipeline) so that node
-    count, window length, and batch size all reflect actual training conditions.
-    Reports SAFE / WARNING / CRITICAL verdict.
+    """Run one full-rollout training step on real data to check peak VRAM usage.
+
+    Reports SAFE / WARNING / CRITICAL verdict based on peak memory utilization.
+
+    Args:
+        args: Parsed command-line arguments.
     """
     device = torch.device(args.device)
     if not torch.cuda.is_available():
         logger.warning("No CUDA device — probe skipped (CPU has no OOM risk).")
         return
 
-    # --- 1. Data Preparation (mirrors train_pipeline) ---
+    # --- Data Preparation ---
     logger.info("loading training data for probe...")
     train_raw, _, _ = FlowData.spawn(
         data_dir=args.data_dir, spatial_dim=args.spatial_dim,
@@ -299,51 +379,47 @@ def probe_pipeline(args: argparse.Namespace) -> None:
                               num_workers=args.num_workers, pin_memory=True)
 
     seq_std, coords_norm, start_t_norm, dt_norm = next(iter(probe_loader))
-    seq_std     = seq_std.to(device)
+    seq_std = seq_std.to(device)
     coords_norm = coords_norm.to(device)
 
     B, T, N, C = seq_std.shape
 
-    # --- 2. Model Initialization ---
+    # --- Model ---
     model = _build_model(args)
     model.to(device).train()
 
     logger.info(f"{hue.y}probe config:{hue.q} "
-                f"batch={hue.m}{B}{hue.q}, "
-                f"frames={hue.m}{T}{hue.q}, "
-                f"nodes={hue.m}{N}{hue.q}, "
-                f"channels={hue.m}{C}{hue.q}, "
+                f"batch={hue.m}{B}{hue.q}, frames={hue.m}{T}{hue.q}, "
+                f"nodes={hue.m}{N}{hue.q}, channels={hue.m}{C}{hue.q}, "
                 f"max_rollout={hue.m}{args.max_rollout_steps}{hue.q}, "
                 f"model={hue.b}{args.model_type}{hue.q}")
 
     optimizer = AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     criterion = NMSECriterion()
 
-    # --- 3. Forward / Backward Pass ---
+    # --- Forward / Backward ---
     torch.cuda.reset_peak_memory_stats(device)
 
     input_state = seq_std[:, 0]
     loss = torch.tensor(0.0, device=device)
-    # Probe mirrors the trainer's _compute_loss exactly:
-    # full BPTT (no detach) + linear step weights (sum = 1, no extra division needed)
     k = args.max_rollout_steps
     total_weight = k * (k + 1)
     for t in range(k):
-        if hasattr(model, "time_encoder"):
+        if hasattr(model, "time_encoder") and model.time_encoder is not None:
             t_norm = start_t_norm.to(device) + t * dt_norm.to(device)
             pred = model(input_state, coords_norm, t_norm=t_norm)
         else:
             pred = model(input_state, coords_norm)
         w_t = 2.0 * (t + 1) / total_weight
         loss = loss + w_t * criterion(pred, seq_std[:, t + 1])
-        input_state = pred  # full BPTT: no detach
+        input_state = pred
     loss.backward()
     optimizer.step()
 
-    # --- 4. VRAM Report ---
-    peak  = torch.cuda.max_memory_allocated(device)
+    # --- VRAM Report ---
+    peak = torch.cuda.max_memory_allocated(device)
     total = torch.cuda.get_device_properties(device).total_memory
-    pct   = 100 * peak / total
+    pct = 100 * peak / total
     if pct < 75:
         status = f"{hue.g}SAFE{hue.q}"
     elif pct < 92:
@@ -355,17 +431,16 @@ def probe_pipeline(args: argparse.Namespace) -> None:
                 f"({hue.m}{total / 1e9:.1f}{hue.q} GB)")
     logger.info(f"peak usage: {hue.m}{peak / 1e9:.2f}{hue.q} GB  "
                 f"({hue.m}{pct:.1f}{hue.q} %)  →  {status}")
-
     logger.info(f"{hue.g}probe completed.{hue.q}\n")
 
 
 # ======================================================================
-# 5. Main Execution
+# 7. Main Execution
 # ======================================================================
 
 if __name__ == "__main__":
     args = flow_args.get_args()
 
-    if "probe" in args.mode:  probe_pipeline(args)
-    if "train" in args.mode:  train_pipeline(args)
-    if "infer" in args.mode:  inference_pipeline(args)
+    if "probe" in args.mode: probe_pipeline(args)
+    if "train" in args.mode: train_pipeline(args)
+    if "infer" in args.mode: inference_pipeline(args)
