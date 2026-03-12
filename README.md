@@ -25,7 +25,7 @@ A modular repository of surrogate models categorized by their mathematical formu
 * **`classical/`**: Classical response surface algorithms
     * Includes: **PRS** (Polynomial Response Surface), **RBF** (Radial Basis Function), **KRG** (Kriging), **SVR** (Support Vector Regression)
 * **`neural/`**: Neural network models
-    * Includes: **MLP** (Multi-Layer Perceptron), **DeepONet**, **GeoFNO** (Geometry-aware Fourier Neural Operator), **U-WNO** (Universal Window-based Neural Operator)
+    * Includes: **MLP** (Multi-Layer Perceptron), **DeepONet**, **GeoFNO** (Geometry-aware Fourier Neural Operator), **HyperFlowNet**, **Transolver**
 * **`multi_fidelity/`**: Multi-fidelity models
     * Includes: **CCA-MFS**, **MFS-MLS**, **MMFS**
 * **`ensemble/`**: Ensemble models
@@ -37,26 +37,33 @@ Training frameworks and utilities:
 * **`base_trainer.py`**: Base trainer class for custom training workflows
 * **`std_trainer.py`**: Standard trainer for static regression tasks
 * **`rollout_trainer.py`**: Trainer for autoregressive sequence prediction
-* **`base_criterion.py`**: Base loss functions
-* **`physics_criterion.py`**: Physics-informed training support
+* **`teacher_forcing_trainer.py`**: Teacher forcing trainer for sequence prediction
+* **`base_criterion.py`**: Loss functions and evaluation metrics
 
 ### 3. Data (`data/`)
 Data loading and preprocessing utilities:
 
 * **`flow_data.py`**: CFD data loading and preprocessing
-* **`scaler.py`**: Data scaling utilities
-* **`CFDRender.py`**: CFD visualization and rendering
-* **`flow_vis.py`**: Flow field visualization tools
+* **`scaler.py`**: Data scaling utilities (StandardScaler, MinMaxScaler)
+* **`boundary.py`**: Boundary condition detection and enforcement
+* **`flow_vis.py`**: Flow field visualization and animation
+* **`flow_plot.py`**: Training curves, error heatmaps, and metrics plots
 
 ### 4. Sampling (`sampling/`)
 Design of Experiments and infill strategies:
 
 * **`doe.py`**: Design of Experiments (LHS, optimized LHS)
-* **`infill.py`**: Infill sampling strategies
-* **`mico_infill.py`**: MICO infill strategy for multi-fidelity optimization
+* **`base_infill.py`**: Base infill sampling strategy
+* **`so_infill.py`**: Single-objective infill strategy (Expected Improvement)
+* **`mo_infill.py`**: Multi-objective infill strategy
+* **`mf_infill.py`**: Multi-fidelity infill strategy
 
 ### 5. Utilities (`utils/`)
-Core utilities and helper functions.
+Core utilities and helper functions:
+
+* **`seeder.py`**: Reproducibility utilities (seed everything)
+* **`hue_logger.py`**: Colored logging with ANSI formatting
+* **`sweep.py`**: Hyperparameter sweep utilities
 
 ## 🚀 Key Features
 
@@ -72,7 +79,6 @@ Core utilities and helper functions.
 
 ### Core Classes
 
-- `wsnet.models.base.Model`: Base model interface
 - `wsnet.training.base_trainer.Trainer`: Base trainer interface
 - `wsnet.data.flow_data.FlowData`: CFD data loader
 - `wsnet.sampling.doe.lhs_design`: Optimized Latin Hypercube Sampling
@@ -97,11 +103,8 @@ predictions = model.predict(test_data)
 
 Check the `examples/` directory for complete workflow examples:
 
-- Basic regression example
-- CFD emulation example
-- Multi-fidelity modeling example
-- Ensemble modeling example
-- Sequential sampling modeling example
+- **`flow_config.py`** + **`flow_train.py`**: CFD emulation pipeline (HyperFlowNet / GeoFNO / Transolver) with training, inference, and visualization
+- **`aero_config.py`** + **`aero_demo.py`**: Aerodynamic optimization benchmark platform with ensemble, multi-fidelity, sequential sampling, and optimization demos
 
 ## ⚙️ Installation and Dependencies
 

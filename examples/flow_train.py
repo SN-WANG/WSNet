@@ -12,7 +12,7 @@ from torch.optim import AdamW
 from torch.utils.data import DataLoader, Dataset
 from typing import Dict, Tuple
 
-import flow_args
+import flow_config
 
 project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 if project_root not in sys.path: sys.path.insert(0, project_root)
@@ -461,7 +461,7 @@ def probe_pipeline(args: argparse.Namespace) -> None:
 # ======================================================================
 
 if __name__ == "__main__":
-    args = flow_args.get_args()
+    args = flow_config.get_args()
 
     if "probe" in args.mode: probe_pipeline(args)
     if "train" in args.mode: train_pipeline(args)

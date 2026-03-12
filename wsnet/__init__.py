@@ -31,9 +31,9 @@ wsnet/
 For detailed documentation and examples, please refer to the README.md file.
 """
 
-__version__ = "2.2.7"
+__version__ = "2.2.8"
 __author__ = "Shengning Wang (王晟宁)"
 __email__ = "snwang2023@163.com"
 __description__ = "A Deep Learning Library for Engineering Surrogate Modeling"
-__url__ = "https://github.com/your-repo/wsnet"
+__url__ = "https://github.com/SN-WANG/wsnet"
 __license__ = "MIT"

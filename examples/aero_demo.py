@@ -10,7 +10,7 @@ import numpy as np
 from scipy.optimize import differential_evolution, NonlinearConstraint
 from scipy.optimize import OptimizeResult
 
-import aero_args
+import aero_config
 
 project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 if project_root not in sys.path: sys.path.insert(0, project_root)
@@ -965,7 +965,7 @@ def optimization_pipeline(
 # ======================================================================
 
 if __name__ == "__main__":
-    args = aero_args.get_args()
+    args = aero_config.get_args()
     seed_everything(args.seed)
 
     logger.info(f"{hue.b}Aero Optimization Benchmark Platform{hue.q}")

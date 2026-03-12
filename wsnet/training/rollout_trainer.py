@@ -125,7 +125,7 @@ class RolloutTrainer(BaseTrainer):
                         f"noise = {hue.m}{self.current_noise_std:.4f}{hue.q}")
             self.log_update_info = False
 
-    def _on_epoch_end(self, **kwargs) -> None:
+    def _on_epoch_end(self, train_loss=None, val_loss=None, **kwargs) -> None:
         """Advance curriculum state at the end of each epoch."""
         self._update_curriculum()
 
