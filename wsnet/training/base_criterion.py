@@ -36,13 +36,15 @@ class BaseCriterion(nn.Module):
 class NMSECriterion(BaseCriterion):
     """Per-channel Normalized Mean Squared Error loss with optional channel weighting.
 
-    Computes per-channel NMSE and sums across channels:
-        L = sum_c w_c * ||target_c - pred_c||^2 / (||target_c||^2 + eps)
+    Computes per-channel NMSE and returns the (weighted) average across channels:
+        L = sum_c (w_c * NMSE_c) / sum_c(w_c)
+    where NMSE_c = ||target_c - pred_c||^2 / (||target_c||^2 + eps).
 
     Each channel is independently normalized by its own energy, preventing
     high-energy channels from dominating the gradient signal. Optional
-    channel_weights allow emphasizing specific channels (e.g., up-weighting
-    a sparse Y-velocity field).
+    channel_weights control the relative importance of each channel without
+    affecting the overall loss magnitude (e.g., up-weighting a sparse
+    Y-velocity field).
     """
 
     def __init__(self, eps: float = 1e-8, channel_weights: Optional[List[float]] = None):
@@ -68,7 +70,8 @@ class NMSECriterion(BaseCriterion):
         nmse_c = mse_c / norm_c  # (C,)
         if self.channel_weights is not None:
             nmse_c = nmse_c * self.channel_weights.to(nmse_c.device)
-        return nmse_c.sum()
+            return nmse_c.sum() / self.channel_weights.sum()
+        return nmse_c.mean()
 
 
 class Metrics:

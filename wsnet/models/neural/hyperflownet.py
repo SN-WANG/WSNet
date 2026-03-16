@@ -54,7 +54,7 @@ class SpatialEncoder(nn.Module):
         self.sigma = sigma
 
         B = torch.randn(spatial_dim, coord_features) * sigma
-        self.register_buffer('B_matrix', B)  # (spatial_dim, coord_features)
+        self.register_buffer("B_matrix", B)  # (spatial_dim, coord_features)
 
     def forward(self, coords: Tensor) -> Tensor:
         """Encode coordinates with RFF.
@@ -94,7 +94,7 @@ class SinusoidalTimeEncoder(nn.Module):
 
         i = torch.arange(time_features, dtype=torch.float32)
         omega = max_steps ** (-i / max(time_features, 1))
-        self.register_buffer('omega', omega)  # (time_features,)
+        self.register_buffer("omega", omega)  # (time_features,)
 
     def encode_time(self, t_norm: Tensor, N: int) -> Tensor:
         """Encode normalized time into sinusoidal embedding.
@@ -142,7 +142,7 @@ class MeshSliceAttention(nn.Module):
         """
         super().__init__()
         assert width % num_heads == 0, \
-            f'width={width} must be divisible by num_heads={num_heads}'
+            f"width={width} must be divisible by num_heads={num_heads}"
 
         self.slice_proj = nn.Linear(width, num_slices)
         self.attn = nn.MultiheadAttention(
@@ -288,7 +288,7 @@ class HyperFlowNet(nn.Module):
         super().__init__()
 
         assert width % num_heads == 0, \
-            f'width={width} must be divisible by num_heads={num_heads}'
+            f"width={width} must be divisible by num_heads={num_heads}"
 
         self.spatial_dim = spatial_dim
         self.use_spatial_encoding = use_spatial_encoding
@@ -411,7 +411,7 @@ class HyperFlowNet(nn.Module):
         seq: List[Tensor] = [current_state.cpu()]
 
         with torch.no_grad():
-            for t in tqdm(range(steps), desc='Predicting', leave=False, dynamic_ncols=True):
+            for t in tqdm(range(steps), desc="Predicting", leave=False, dynamic_ncols=True):
                 t_norm = torch.full((B,), t / max(steps, 1), device=device)
                 next_state = self.forward(current_state, coords, t_norm=t_norm)
 
