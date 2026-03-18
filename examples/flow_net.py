@@ -19,7 +19,7 @@ if project_root not in sys.path: sys.path.insert(0, project_root)
 
 
 from wsnet.models.neural.geofno import GeoFNO
-from wsnet.models.neural.hyperflownet import HyperFlowNet
+from wsnet.models.neural.hyperflow_net import HyperFlowNet
 from wsnet.models.neural.transolver import Transolver
 
 from wsnet.data.flow_data import FlowData
@@ -98,8 +98,8 @@ def _build_model(args: argparse.Namespace) -> torch.nn.Module:
             use_spatial_encoding=args.use_spatial_encoding,
             use_temporal_encoding=args.use_temporal_encoding,
             # Encoding params
-            coord_features=args.coord_features, coord_sigma=args.coord_sigma,
-            time_features=args.time_features, max_steps=args.max_steps,
+            coord_features=args.coord_features,
+            time_features=args.time_features, freq_base=args.freq_base,
         )
 
     elif args.model_type == "geofno":
@@ -245,10 +245,10 @@ def inference_pipeline(args: argparse.Namespace) -> None:
     """
     device = torch.device(args.device)
     run_dir = Path(args.output_dir)
-    model_path = run_dir / "best.pt"
+    model_path = run_dir / "ckpt.pt"
 
     if not model_path.exists():
-        raise FileNotFoundError(f"best.pt not found at {model_path}.")
+        raise FileNotFoundError(f"ckpt.pt not found at {model_path}.")
 
     # --- Restore State ---
     logger.info("loading training artifacts...")

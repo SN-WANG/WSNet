@@ -32,11 +32,11 @@ plt.rcParams.update({
 
 # Color palette for consistent model styling
 MODEL_COLORS = {
-    'HyperFlowNet': '#2196F3',
-    'GeoFNO': '#FF9800',
-    'Transolver': '#4CAF50',
-    'HyperFlowNet (no RFF)': '#90CAF9',
-    'HyperFlowNet (no time)': '#64B5F6',
+    "HyperFlowNet": "#2196F3",
+    "GeoFNO": "#FF9800",
+    "Transolver": "#4CAF50",
+    "HyperFlowNet (no LFF)": "#90CAF9",
+    "HyperFlowNet (no time)": "#64B5F6",
 }
 
 

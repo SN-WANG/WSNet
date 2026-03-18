@@ -230,7 +230,7 @@ class FlowData(Dataset):
                     f"channels: {hue.m}{dataset.seqs[0].shape[2]}{hue.q}")
 
     @staticmethod
-    def spawn(data_dir: Union[str, Path] = "./dataset", split_counts: Tuple[int, int] = (4, 1),
+    def spawn(data_dir: Union[str, Path] = "./dataset", split_counts: Tuple[int, int] = (2, 1),
         spatial_dim: int = 2, limits: Optional[Tuple[int, int]] = None, win_len: int = 16, win_stride: int = 1
     ) -> Tuple["FlowData", "FlowData", "FlowData"]:
         """
