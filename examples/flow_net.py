@@ -9,6 +9,7 @@ import argparse
 from contextlib import nullcontext
 from pathlib import Path
 from torch import Tensor
+from torch.optim import AdamW
 from torch.utils.data import DataLoader, Dataset
 from typing import Dict, Tuple
 
@@ -34,7 +35,6 @@ from wsnet.data.scaler import StandardScalerTensor, MinMaxScalerTensor
 from wsnet.training.rollout_trainer import RolloutTrainer
 from wsnet.training.teacher_forcing_trainer import TeacherForcingTrainer
 from wsnet.training.base_criterion import Metrics, NMSECriterion
-from wsnet.training.base_trainer import build_adamw_optimizer, resolve_amp_dtype
 
 from wsnet.utils.seeder import seed_everything
 from wsnet.utils.hue_logger import hue, logger
@@ -128,44 +128,40 @@ def _build_model(args: argparse.Namespace) -> torch.nn.Module:
         )
 
 
-def _configure_torch_runtime(args: argparse.Namespace) -> None:
+def _configure_torch_runtime() -> None:
     """Configure PyTorch runtime flags for high-throughput execution.
-
-    Args:
-        args: Parsed command-line arguments.
     """
     if not torch.cuda.is_available():
         return
 
-    torch.backends.cuda.matmul.allow_tf32 = bool(args.use_tf32)
-    torch.backends.cudnn.allow_tf32 = bool(args.use_tf32)
-    torch.set_float32_matmul_precision("high" if args.use_tf32 else "highest")
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+    torch.set_float32_matmul_precision("high")
 
 
-def _get_autocast_context(args: argparse.Namespace, device: torch.device):
+def _get_autocast_context(device: torch.device):
     """Build the autocast context for the current device.
 
     Args:
-        args: Parsed command-line arguments.
         device: Active runtime device.
 
     Returns:
         Context manager enabling AMP when configured.
     """
-    if device.type != "cuda" or not args.use_amp:
+    if device.type != "cuda":
         return nullcontext()
-    return torch.autocast(device_type="cuda", dtype=resolve_amp_dtype(args.amp_dtype))
+    return torch.autocast(device_type="cuda", dtype=torch.bfloat16)
 
 
 def _get_dataloader_kwargs(
-    args: argparse.Namespace,
+    num_workers: int,
     batch_size: int,
     shuffle: bool,
 ) -> Dict:
     """Construct DataLoader kwargs with optional worker prefetch settings.
 
     Args:
-        args: Parsed command-line arguments.
+        num_workers: Number of DataLoader workers.
         batch_size: Loader batch size.
         shuffle: Whether to shuffle the dataset.
 
@@ -175,26 +171,26 @@ def _get_dataloader_kwargs(
     kwargs = {
         "batch_size": batch_size,
         "shuffle": shuffle,
-        "num_workers": args.num_workers,
-        "pin_memory": args.pin_memory,
+        "num_workers": num_workers,
+        "pin_memory": True,
     }
-    if args.num_workers > 0:
-        kwargs["persistent_workers"] = args.persistent_workers
-        kwargs["prefetch_factor"] = args.prefetch_factor
+    if num_workers > 0:
+        kwargs["persistent_workers"] = True
+        kwargs["prefetch_factor"] = 4
     return kwargs
 
 
-def _maybe_compile_model(model: torch.nn.Module, args: argparse.Namespace) -> torch.nn.Module:
+def _maybe_compile_model(model: torch.nn.Module) -> torch.nn.Module:
     """Compile a model when torch.compile is enabled.
 
     Args:
         model: Model already placed on the target device.
-        args: Parsed command-line arguments.
 
     Returns:
         torch.nn.Module: Compiled model when available, otherwise the original model.
     """
-    if not args.use_compile:
+    device = next(model.parameters()).device
+    if device.type != "cuda":
         return model
 
     if not hasattr(torch, "compile"):
@@ -202,8 +198,8 @@ def _maybe_compile_model(model: torch.nn.Module, args: argparse.Namespace) -> to
         return model
 
     try:
-        logger.info(f"compiling model with mode {hue.m}{args.compile_mode}{hue.q}...")
-        return torch.compile(model, mode=args.compile_mode)
+        logger.info(f"compiling model with mode {hue.m}default{hue.q}...")
+        return torch.compile(model, mode="default")
     except Exception as exc:
         logger.warning(f"torch.compile failed ({type(exc).__name__}: {exc}); continuing without compilation.")
         return model
@@ -240,11 +236,6 @@ def _build_trainer(args: argparse.Namespace, model: torch.nn.Module,
             noise_std_init=args.noise_std_init, noise_decay=args.noise_decay,
             boundary_condition=boundary_condition,
             channel_weights=args.channel_weights,
-            use_amp=args.use_amp,
-            amp_dtype=args.amp_dtype,
-            use_compile=args.use_compile,
-            compile_mode=args.compile_mode,
-            use_fused_optimizer=args.use_fused_optimizer,
         )
 
     elif args.trainer_type == "teacher_forcing":
@@ -252,11 +243,6 @@ def _build_trainer(args: argparse.Namespace, model: torch.nn.Module,
             model=model, lr=args.lr, max_epochs=args.max_epochs,
             scalers=scalers, output_dir=output_dir, device=args.device,
             weight_decay=args.weight_decay, eta_min=args.eta_min,
-            use_amp=args.use_amp,
-            amp_dtype=args.amp_dtype,
-            use_compile=args.use_compile,
-            compile_mode=args.compile_mode,
-            use_fused_optimizer=args.use_fused_optimizer,
         )
 
     else:
@@ -277,7 +263,7 @@ def train_pipeline(args: argparse.Namespace) -> None:
         args: Parsed command-line arguments.
     """
     seed_everything(args.seed)
-    _configure_torch_runtime(args)
+    _configure_torch_runtime()
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -309,10 +295,10 @@ def train_pipeline(args: argparse.Namespace) -> None:
                                    coord_scaler=coord_scaler)
 
     train_loader = DataLoader(train_dataset, **_get_dataloader_kwargs(
-        args=args, batch_size=args.batch_size, shuffle=True,
+        num_workers=args.num_workers, batch_size=args.batch_size, shuffle=True,
     ))
     val_loader = DataLoader(val_dataset, **_get_dataloader_kwargs(
-        args=args, batch_size=args.batch_size, shuffle=False,
+        num_workers=args.num_workers, batch_size=args.batch_size, shuffle=False,
     ))
 
     # --- Model Initialization ---
@@ -338,7 +324,7 @@ def inference_pipeline(args: argparse.Namespace) -> None:
     Args:
         args: Parsed command-line arguments.
     """
-    _configure_torch_runtime(args)
+    _configure_torch_runtime()
     device = torch.device(args.device)
     run_dir = Path(args.output_dir)
     model_path = run_dir / "ckpt.pt"
@@ -374,7 +360,7 @@ def inference_pipeline(args: argparse.Namespace) -> None:
         test_raw, feature_scaler=feature_scaler, coord_scaler=coord_scaler
     )
     test_loader = DataLoader(test_dataset, **_get_dataloader_kwargs(
-        args=args, batch_size=1, shuffle=False,
+        num_workers=args.num_workers, batch_size=1, shuffle=False,
     ))
 
     # --- Model Restoration ---
@@ -386,7 +372,7 @@ def inference_pipeline(args: argparse.Namespace) -> None:
     model.load_state_dict(checkpoint["model_state_dict"])
     model.to(device)
     model.eval()
-    model = _maybe_compile_model(model, args)
+    model = _maybe_compile_model(model)
 
     # --- Inference ---
     logger.info(f'{hue.g}running inference on test set...{hue.q}')
@@ -404,7 +390,7 @@ def inference_pipeline(args: argparse.Namespace) -> None:
             initial_state = seq_std[:, 0]
             coords_raw = test_raw.coords[i].cpu()
 
-            with _get_autocast_context(args, device):
+            with _get_autocast_context(device):
                 pred_seq_std = model.predict(
                     initial_state, coords_norm, steps, boundary_condition=bc
                 )
@@ -481,7 +467,7 @@ def probe_pipeline(args: argparse.Namespace) -> None:
     Args:
         args: Parsed command-line arguments.
     """
-    _configure_torch_runtime(args)
+    _configure_torch_runtime()
     device = torch.device(args.device)
     if not torch.cuda.is_available():
         logger.warning("No CUDA device — probe skipped (CPU has no OOM risk).")
@@ -503,7 +489,7 @@ def probe_pipeline(args: argparse.Namespace) -> None:
         train_raw, feature_scaler=feature_scaler, coord_scaler=coord_scaler
     )
     probe_loader = DataLoader(probe_dataset, **_get_dataloader_kwargs(
-        args=args, batch_size=args.batch_size, shuffle=False,
+        num_workers=args.num_workers, batch_size=args.batch_size, shuffle=False,
     ))
 
     seq_std, coords_norm, start_t_norm, dt_norm = next(iter(probe_loader))
@@ -518,7 +504,7 @@ def probe_pipeline(args: argparse.Namespace) -> None:
     model = _build_model(args)
     model = model.to(device)
     model.train()
-    model = _maybe_compile_model(model, args)
+    model = _maybe_compile_model(model)
 
     logger.info(f"{hue.y}probe config:{hue.q} "
                 f"batch={hue.m}{B}{hue.q}, frames={hue.m}{T}{hue.q}, "
@@ -526,26 +512,17 @@ def probe_pipeline(args: argparse.Namespace) -> None:
                 f"max_rollout={hue.m}{args.max_rollout_steps}{hue.q}, "
                 f"model={hue.b}{args.model_type}{hue.q}")
 
-    optimizer = build_adamw_optimizer(
-        model.parameters(),
-        lr=args.lr,
-        weight_decay=args.weight_decay,
-        use_fused=args.use_fused_optimizer,
-        device_type=device.type,
-    )
+    optimizer_kwargs = {"lr": args.lr, "weight_decay": args.weight_decay}
+    if device.type == "cuda" and "fused" in AdamW.__init__.__code__.co_varnames:
+        optimizer_kwargs["fused"] = True
+    optimizer = AdamW(model.parameters(), **optimizer_kwargs)
     criterion = NMSECriterion(channel_weights=args.channel_weights)
-    amp_dtype = resolve_amp_dtype(args.amp_dtype)
-    scaler_device = "cuda" if device.type == "cuda" else "cpu"
-    grad_scaler = torch.amp.GradScaler(
-        scaler_device,
-        enabled=args.use_amp and device.type == "cuda" and amp_dtype == torch.float16,
-    )
 
     # --- Forward / Backward ---
     torch.cuda.reset_peak_memory_stats(device)
 
     optimizer.zero_grad(set_to_none=True)
-    with _get_autocast_context(args, device):
+    with _get_autocast_context(device):
         input_state = seq_std[:, 0]
         loss = torch.tensor(0.0, device=device)
         k = args.max_rollout_steps
@@ -559,13 +536,8 @@ def probe_pipeline(args: argparse.Namespace) -> None:
             w_t = 2.0 * (t + 1) / total_weight
             loss = loss + w_t * criterion(pred, seq_std[:, t + 1])
             input_state = pred
-    if grad_scaler.is_enabled():
-        grad_scaler.scale(loss).backward()
-        grad_scaler.step(optimizer)
-        grad_scaler.update()
-    else:
-        loss.backward()
-        optimizer.step()
+    loss.backward()
+    optimizer.step()
 
     # --- VRAM Report ---
     peak = torch.cuda.max_memory_allocated(device)

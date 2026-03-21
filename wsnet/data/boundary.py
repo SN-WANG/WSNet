@@ -121,7 +121,7 @@ class BoundaryCondition:
             return pred
 
         mask = self.wall_mask.to(pred.device)
-        vals = self.wall_values_std.to(pred.device)
+        vals = self.wall_values_std.to(device=pred.device, dtype=pred.dtype)
 
         out = pred.clone()
         for ch in self.enforce_channels:

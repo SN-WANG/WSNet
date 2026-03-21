@@ -3,10 +3,11 @@
 
 import torch
 from torch import nn, Tensor
+from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from typing import Any, Optional
 
-from wsnet.training.base_trainer import BaseTrainer, build_adamw_optimizer
+from wsnet.training.base_trainer import BaseTrainer
 from wsnet.training.base_criterion import NMSECriterion
 from wsnet.utils.hue_logger import hue, logger
 
@@ -73,17 +74,13 @@ class RolloutTrainer(BaseTrainer):
         optimizer = kwargs.pop("optimizer", None)
         scheduler = kwargs.pop("scheduler", None)
         criterion = kwargs.pop("criterion", None)
-        use_fused_optimizer = kwargs.pop("use_fused_optimizer", True)
         device_type = torch.device(kwargs.get("device", "cpu")).type
 
         if optimizer is None:
-            optimizer = build_adamw_optimizer(
-                model.parameters(),
-                lr=lr,
-                weight_decay=weight_decay,
-                use_fused=use_fused_optimizer,
-                device_type=device_type,
-            )
+            optimizer_kwargs = {"lr": lr, "weight_decay": weight_decay}
+            if device_type == "cuda" and "fused" in AdamW.__init__.__code__.co_varnames:
+                optimizer_kwargs["fused"] = True
+            optimizer = AdamW(model.parameters(), **optimizer_kwargs)
 
         if scheduler is None:
             scheduler = CosineAnnealingLR(optimizer, T_max=max_epochs, eta_min=eta_min)

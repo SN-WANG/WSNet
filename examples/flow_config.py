@@ -63,15 +63,6 @@ def get_args() -> argparse.Namespace:
     data.add_argument(
         "--num_workers", type=int, default=4,
         help="Number of DataLoader worker subprocesses.")
-    data.add_argument(
-        "--pin_memory", action=argparse.BooleanOptionalAction, default=True,
-        help="Pin host memory in DataLoader for faster CUDA transfers.")
-    data.add_argument(
-        "--persistent_workers", action=argparse.BooleanOptionalAction, default=True,
-        help="Keep DataLoader workers alive across epochs when num_workers > 0.")
-    data.add_argument(
-        "--prefetch_factor", type=int, default=4,
-        help="Number of batches prefetched by each DataLoader worker.")
 
     # ==================================================================
     # 3. Model Selection
@@ -195,31 +186,7 @@ def get_args() -> argparse.Namespace:
              "Default: Vy 3x weighted to improve Y-velocity prediction.")
 
     # ==================================================================
-    # 9. Runtime Optimization
-    # ==================================================================
-    runtime = parser.add_argument_group("Runtime Optimization")
-    runtime.add_argument(
-        "--use_amp", action=argparse.BooleanOptionalAction, default=torch.cuda.is_available(),
-        help="Enable CUDA automatic mixed precision during training and inference.")
-    runtime.add_argument(
-        "--amp_dtype", type=str, default="bf16", choices=["bf16", "fp16"],
-        help="Autocast dtype when AMP is enabled.")
-    runtime.add_argument(
-        "--use_tf32", action=argparse.BooleanOptionalAction, default=True,
-        help="Allow TF32 matmul/cuDNN kernels on supported NVIDIA GPUs.")
-    runtime.add_argument(
-        "--use_fused_optimizer", action=argparse.BooleanOptionalAction, default=True,
-        help="Use fused AdamW on CUDA when supported by the current PyTorch build.")
-    runtime.add_argument(
-        "--use_compile", action=argparse.BooleanOptionalAction, default=False,
-        help="Compile the model with torch.compile for potentially higher throughput.")
-    runtime.add_argument(
-        "--compile_mode", type=str, default="default",
-        choices=["default", "reduce-overhead", "max-autotune"],
-        help="Compilation mode passed to torch.compile.")
-
-    # ==================================================================
-    # 10. Curriculum Learning (Rollout Trainer Only)
+    # 9. Curriculum Learning
     # ==================================================================
     curriculum = parser.add_argument_group("Curriculum (Rollout Trainer)")
     curriculum.add_argument(
