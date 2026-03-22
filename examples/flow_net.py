@@ -334,7 +334,7 @@ def inference_pipeline(args: argparse.Namespace) -> None:
 
     # --- Restore State ---
     logger.info("loading training artifacts...")
-    checkpoint = torch.load(model_path, map_location=device, weights_only=True)
+    checkpoint = torch.load(model_path, map_location="cpu", weights_only=True)
 
     feature_scaler = StandardScalerTensor()
     feature_scaler.load_state_dict(checkpoint["scaler_state_dict"]["feature_scaler"])
