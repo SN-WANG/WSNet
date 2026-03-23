@@ -52,7 +52,7 @@ def get_args() -> argparse.Namespace:
         "--spatial_dim", type=int, default=2, choices=[2, 3],
         help="Spatial dimensionality of the mesh (2D or 3D).")
     data.add_argument(
-        "--win_len", type=int, default=8,
+        "--win_len", type=int, default=21,
         help="Temporal window length for sequence slicing (input + target).")
     data.add_argument(
         "--win_stride", type=int, default=1,
@@ -175,7 +175,7 @@ def get_args() -> argparse.Namespace:
         "--weight_decay", type=float, default=1e-4,
         help="L2 regularization coefficient for AdamW.")
     optim.add_argument(
-        "--max_epochs", type=int, default=400,
+        "--max_epochs", type=int, default=720,
         help="Maximum number of training epochs.")
     optim.add_argument(
         "--eta_min", type=float, default=1e-6,
@@ -190,10 +190,10 @@ def get_args() -> argparse.Namespace:
     # ==================================================================
     curriculum = parser.add_argument_group("Curriculum (Rollout Trainer)")
     curriculum.add_argument(
-        "--max_rollout_steps", type=int, default=7,
+        "--max_rollout_steps", type=int, default=20,
         help="Maximum autoregressive rollout steps (curriculum ceiling).")
     curriculum.add_argument(
-        "--rollout_patience", type=int, default=50,
+        "--rollout_patience", type=int, default=35,
         help="Epochs between curriculum difficulty advances.")
     curriculum.add_argument(
         "--noise_std_init", type=float, default=0.01,
