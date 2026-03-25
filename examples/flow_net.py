@@ -6,7 +6,6 @@ import sys
 import json
 import torch
 import argparse
-from contextlib import nullcontext
 from pathlib import Path
 from torch import Tensor
 from torch.optim import AdamW
@@ -128,83 +127,6 @@ def _build_model(args: argparse.Namespace) -> torch.nn.Module:
         )
 
 
-def _configure_torch_runtime() -> None:
-    """Configure PyTorch runtime flags for high-throughput execution.
-    """
-    if not torch.cuda.is_available():
-        return
-
-    torch.backends.cuda.matmul.allow_tf32 = True
-    torch.backends.cudnn.allow_tf32 = True
-    torch.set_float32_matmul_precision("high")
-
-
-def _get_autocast_context(device: torch.device):
-    """Build the autocast context for the current device.
-
-    Args:
-        device: Active runtime device.
-
-    Returns:
-        Context manager enabling AMP when configured.
-    """
-    if device.type != "cuda":
-        return nullcontext()
-    return torch.autocast(device_type="cuda", dtype=torch.bfloat16)
-
-
-def _get_dataloader_kwargs(
-    num_workers: int,
-    batch_size: int,
-    shuffle: bool,
-) -> Dict:
-    """Construct DataLoader kwargs with optional worker prefetch settings.
-
-    Args:
-        num_workers: Number of DataLoader workers.
-        batch_size: Loader batch size.
-        shuffle: Whether to shuffle the dataset.
-
-    Returns:
-        Dict: Keyword arguments for DataLoader construction.
-    """
-    kwargs = {
-        "batch_size": batch_size,
-        "shuffle": shuffle,
-        "num_workers": num_workers,
-        "pin_memory": True,
-    }
-    if num_workers > 0:
-        kwargs["persistent_workers"] = True
-        kwargs["prefetch_factor"] = 4
-    return kwargs
-
-
-def _maybe_compile_model(model: torch.nn.Module) -> torch.nn.Module:
-    """Compile a model when torch.compile is enabled.
-
-    Args:
-        model: Model already placed on the target device.
-
-    Returns:
-        torch.nn.Module: Compiled model when available, otherwise the original model.
-    """
-    device = next(model.parameters()).device
-    if device.type != "cuda":
-        return model
-
-    if not hasattr(torch, "compile"):
-        logger.warning("torch.compile is unavailable in this PyTorch build; continuing without compilation.")
-        return model
-
-    try:
-        logger.info(f"compiling model with mode {hue.m}default{hue.q}...")
-        return torch.compile(model, mode="default")
-    except Exception as exc:
-        logger.warning(f"torch.compile failed ({type(exc).__name__}: {exc}); continuing without compilation.")
-        return model
-
-
 # ======================================================================
 # 3. Trainer Factory
 # ======================================================================
@@ -263,7 +185,6 @@ def train_pipeline(args: argparse.Namespace) -> None:
         args: Parsed command-line arguments.
     """
     seed_everything(args.seed)
-    _configure_torch_runtime()
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -294,12 +215,10 @@ def train_pipeline(args: argparse.Namespace) -> None:
     val_dataset = ScaledCFDataset(val_raw, feature_scaler=feature_scaler,
                                    coord_scaler=coord_scaler)
 
-    train_loader = DataLoader(train_dataset, **_get_dataloader_kwargs(
-        num_workers=args.num_workers, batch_size=args.batch_size, shuffle=True,
-    ))
-    val_loader = DataLoader(val_dataset, **_get_dataloader_kwargs(
-        num_workers=args.num_workers, batch_size=args.batch_size, shuffle=False,
-    ))
+    train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True,
+                              num_workers=args.num_workers, pin_memory=True)
+    val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False,
+                            num_workers=args.num_workers, pin_memory=True)
 
     # --- Model Initialization ---
     logger.info(f"instantiating model: {hue.b}{args.model_type}{hue.q} "
@@ -324,7 +243,6 @@ def inference_pipeline(args: argparse.Namespace) -> None:
     Args:
         args: Parsed command-line arguments.
     """
-    _configure_torch_runtime()
     device = torch.device(args.device)
     run_dir = Path(args.output_dir)
     model_path = run_dir / "ckpt.pt"
@@ -334,7 +252,7 @@ def inference_pipeline(args: argparse.Namespace) -> None:
 
     # --- Restore State ---
     logger.info("loading training artifacts...")
-    checkpoint = torch.load(model_path, map_location="cpu", weights_only=True)
+    checkpoint = torch.load(model_path, map_location=device, weights_only=True)
 
     feature_scaler = StandardScalerTensor()
     feature_scaler.load_state_dict(checkpoint["scaler_state_dict"]["feature_scaler"])
@@ -359,9 +277,7 @@ def inference_pipeline(args: argparse.Namespace) -> None:
     test_dataset = ScaledCFDataset(
         test_raw, feature_scaler=feature_scaler, coord_scaler=coord_scaler
     )
-    test_loader = DataLoader(test_dataset, **_get_dataloader_kwargs(
-        num_workers=args.num_workers, batch_size=1, shuffle=False,
-    ))
+    test_loader = DataLoader(test_dataset, batch_size=1, shuffle=False)
 
     # --- Model Restoration ---
     model = _build_model(args)
@@ -372,7 +288,6 @@ def inference_pipeline(args: argparse.Namespace) -> None:
     model.load_state_dict(checkpoint["model_state_dict"])
     model.to(device)
     model.eval()
-    model = _maybe_compile_model(model)
 
     # --- Inference ---
     logger.info(f'{hue.g}running inference on test set...{hue.q}')
@@ -380,20 +295,18 @@ def inference_pipeline(args: argparse.Namespace) -> None:
 
     case_metrics: Dict[str, Dict[str, Dict[str, Dict[str, float]]]] = {}
 
-    with torch.inference_mode():
+    with torch.no_grad():
         for i, (seq_std, coords_norm, _, _) in enumerate(test_loader):
-            seq_std = seq_std.to(device, non_blocking=device.type == "cuda")
-            coords_norm = coords_norm.to(device, non_blocking=device.type == "cuda")
+            seq_std = seq_std.to(device)
+            coords_norm = coords_norm.to(device)
 
             case_name = test_raw.case_names[i]
             steps = seq_std.shape[1] - 1
             initial_state = seq_std[:, 0]
             coords_raw = test_raw.coords[i].cpu()
 
-            with _get_autocast_context(device):
-                pred_seq_std = model.predict(
-                    initial_state, coords_norm, steps, boundary_condition=bc
-                )
+            pred_seq_std = model.predict(initial_state, coords_norm, steps,
+                                         boundary_condition=bc)
 
             pred_seq = feature_scaler.inverse_transform(pred_seq_std).cpu().squeeze(0)
             gt_seq = feature_scaler.inverse_transform(seq_std).cpu().squeeze(0)
@@ -467,7 +380,6 @@ def probe_pipeline(args: argparse.Namespace) -> None:
     Args:
         args: Parsed command-line arguments.
     """
-    _configure_torch_runtime()
     device = torch.device(args.device)
     if not torch.cuda.is_available():
         logger.warning("No CUDA device — probe skipped (CPU has no OOM risk).")
@@ -488,23 +400,18 @@ def probe_pipeline(args: argparse.Namespace) -> None:
     probe_dataset = ScaledCFDataset(
         train_raw, feature_scaler=feature_scaler, coord_scaler=coord_scaler
     )
-    probe_loader = DataLoader(probe_dataset, **_get_dataloader_kwargs(
-        num_workers=args.num_workers, batch_size=args.batch_size, shuffle=False,
-    ))
+    probe_loader = DataLoader(probe_dataset, batch_size=args.batch_size, shuffle=False,
+                              num_workers=args.num_workers, pin_memory=True)
 
     seq_std, coords_norm, start_t_norm, dt_norm = next(iter(probe_loader))
-    seq_std = seq_std.to(device, non_blocking=True)
-    coords_norm = coords_norm.to(device, non_blocking=True)
-    start_t_norm = start_t_norm.to(device, non_blocking=True)
-    dt_norm = dt_norm.to(device, non_blocking=True)
+    seq_std = seq_std.to(device)
+    coords_norm = coords_norm.to(device)
 
     B, T, N, C = seq_std.shape
 
     # --- Model ---
     model = _build_model(args)
-    model = model.to(device)
-    model.train()
-    model = _maybe_compile_model(model)
+    model.to(device).train()
 
     logger.info(f"{hue.y}probe config:{hue.q} "
                 f"batch={hue.m}{B}{hue.q}, frames={hue.m}{T}{hue.q}, "
@@ -512,30 +419,25 @@ def probe_pipeline(args: argparse.Namespace) -> None:
                 f"max_rollout={hue.m}{args.max_rollout_steps}{hue.q}, "
                 f"model={hue.b}{args.model_type}{hue.q}")
 
-    optimizer_kwargs = {"lr": args.lr, "weight_decay": args.weight_decay}
-    if device.type == "cuda" and "fused" in AdamW.__init__.__code__.co_varnames:
-        optimizer_kwargs["fused"] = True
-    optimizer = AdamW(model.parameters(), **optimizer_kwargs)
+    optimizer = AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     criterion = NMSECriterion(channel_weights=args.channel_weights)
 
     # --- Forward / Backward ---
     torch.cuda.reset_peak_memory_stats(device)
 
-    optimizer.zero_grad(set_to_none=True)
-    with _get_autocast_context(device):
-        input_state = seq_std[:, 0]
-        loss = torch.tensor(0.0, device=device)
-        k = args.max_rollout_steps
-        total_weight = k * (k + 1)
-        for t in range(k):
-            if hasattr(model, "time_encoder") and model.time_encoder is not None:
-                t_norm = start_t_norm + t * dt_norm
-                pred = model(input_state, coords_norm, t_norm=t_norm)
-            else:
-                pred = model(input_state, coords_norm)
-            w_t = 2.0 * (t + 1) / total_weight
-            loss = loss + w_t * criterion(pred, seq_std[:, t + 1])
-            input_state = pred
+    input_state = seq_std[:, 0]
+    loss = torch.tensor(0.0, device=device)
+    k = args.max_rollout_steps
+    total_weight = k * (k + 1)
+    for t in range(k):
+        if hasattr(model, "time_encoder") and model.time_encoder is not None:
+            t_norm = start_t_norm.to(device) + t * dt_norm.to(device)
+            pred = model(input_state, coords_norm, t_norm=t_norm)
+        else:
+            pred = model(input_state, coords_norm)
+        w_t = 2.0 * (t + 1) / total_weight
+        loss = loss + w_t * criterion(pred, seq_std[:, t + 1])
+        input_state = pred
     loss.backward()
     optimizer.step()
 

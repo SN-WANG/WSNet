@@ -5,7 +5,6 @@ import json
 import time
 import torch
 import numpy as np
-from contextlib import nullcontext
 from torch import nn, Tensor
 from torch.utils.data import DataLoader
 from torch.optim import Optimizer, Adam
@@ -45,19 +44,6 @@ class BaseTrainer:
         """
         self.device = torch.device(device)
         self.model = model.to(self.device)
-        self.use_amp = self.device.type == "cuda"
-        self.use_non_blocking = self.device.type == "cuda"
-        self.use_compile = self.device.type == "cuda"
-
-        if self.use_compile:
-            if not hasattr(torch, "compile"):
-                logger.warning("torch.compile is unavailable in this PyTorch build; continuing without compilation.")
-            else:
-                try:
-                    self.model = torch.compile(self.model, mode="default")
-                except Exception as exc:
-                    logger.warning(f"torch.compile failed ({type(exc).__name__}: {exc}); continuing without compilation.")
-                    self.use_compile = False
 
         self.scalers = scalers
 
@@ -75,31 +61,6 @@ class BaseTrainer:
         self.best_loss = float("inf")
         self.history: List[Dict[str, Any]] = []
 
-    def _move_to_device(self, item: Any) -> Any:
-        """Recursively move tensors to the configured device.
-
-        Args:
-            item: Arbitrary batch item containing tensors.
-
-        Returns:
-            Any: Item with all tensors moved onto the trainer device.
-        """
-        if isinstance(item, Tensor):
-            return item.to(self.device, non_blocking=self.use_non_blocking)
-        if isinstance(item, tuple):
-            return tuple(self._move_to_device(v) for v in item)
-        if isinstance(item, list):
-            return [self._move_to_device(v) for v in item]
-        if isinstance(item, dict):
-            return {k: self._move_to_device(v) for k, v in item.items()}
-        return item
-
-    def _autocast_context(self):
-        """Return the autocast context used for forward and loss evaluation."""
-        if not self.use_amp:
-            return nullcontext()
-        return torch.autocast(device_type="cuda", dtype=torch.bfloat16)
-
     def _compute_loss(self, batch: Any) -> Tensor:
         """
         Abstract method: Calculate the loss for a single batch.
@@ -112,10 +73,6 @@ class BaseTrainer:
             Tensor: Scalar loss tensor (Attached to graph). Shape: (1,)
         """
         raise NotImplementedError('Subclasses must implement _compute_loss.')
-
-    def _unwrap_model(self) -> nn.Module:
-        """Return the original nn.Module when torch.compile wraps the model."""
-        return self.model._orig_mod if hasattr(self.model, "_orig_mod") else self.model
 
     def _run_epoch(self, loader: DataLoader, is_training: bool) -> float:
         """
@@ -136,15 +93,16 @@ class BaseTrainer:
         with context:
             pbar = tqdm(loader, desc="Training" if is_training else "Validating", leave=False, dynamic_ncols=True)
             for batch in pbar:
-                batch = self._move_to_device(batch)
+                # move batch to device (handling lists/tuples generic logic)
+                if isinstance(batch, (list, tuple)):
+                    batch = [b.to(self.device) if isinstance(b, Tensor) else b for b in batch]
+                elif isinstance(batch, dict):
+                    batch = {k: v.to(self.device) if isinstance(v, Tensor) else v for k, v in batch.items()}
+
+                loss = self._compute_loss(batch)
 
                 if is_training:
                     self.optimizer.zero_grad(set_to_none=True)
-
-                with self._autocast_context():
-                    loss = self._compute_loss(batch)
-
-                if is_training:
                     loss.backward()
                     self.optimizer.step()
 
@@ -174,7 +132,7 @@ class BaseTrainer:
         """
         state = {
             "epoch": self.current_epoch,
-            "model_state_dict": self._unwrap_model().state_dict(),
+            "model_state_dict": self.model.state_dict(),
             "optimizer_state_dict": self.optimizer.state_dict(),
             "val_loss": val_loss,
             **extra_state

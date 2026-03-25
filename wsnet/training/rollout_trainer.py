@@ -74,13 +74,9 @@ class RolloutTrainer(BaseTrainer):
         optimizer = kwargs.pop("optimizer", None)
         scheduler = kwargs.pop("scheduler", None)
         criterion = kwargs.pop("criterion", None)
-        device_type = torch.device(kwargs.get("device", "cpu")).type
 
         if optimizer is None:
-            optimizer_kwargs = {"lr": lr, "weight_decay": weight_decay}
-            if device_type == "cuda" and "fused" in AdamW.__init__.__code__.co_varnames:
-                optimizer_kwargs["fused"] = True
-            optimizer = AdamW(model.parameters(), **optimizer_kwargs)
+            optimizer = AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
 
         if scheduler is None:
             scheduler = CosineAnnealingLR(optimizer, T_max=max_epochs, eta_min=eta_min)
