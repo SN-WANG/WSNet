@@ -361,7 +361,7 @@ if __name__ == "__main__":
     - From <project_name>/wsnet/utils/tools/sweep.py: relative_depth=4
     """
     main(
-        relative_depth=3,           # Adjust based on file location
+        relative_depth=2,           # Adjust based on file location
         auto_clean=True,            # Clean __pycache__ and *.pyc
         print_structure=True,       # Print directory tree
         copy_clipboard=True,        # Copy tree to clipboard
