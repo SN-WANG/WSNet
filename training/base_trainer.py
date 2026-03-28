@@ -13,8 +13,8 @@ from tqdm.auto import tqdm
 from pathlib import Path
 from typing import List, Dict, Any, Optional, Union
 
-from wsnet.data.scaler import StandardScalerTensor
-from wsnet.utils.hue_logger import hue, logger
+from utils.scaler import StandardScalerTensor
+from utils.hue_logger import hue, logger
 
 class BaseTrainer:
     """

@@ -14,7 +14,7 @@ The repository keeps reusable core modules only:
 WSNet is intended to be cloned and used directly from the source tree.
 """
 
-__version__ = "2.3.1"
+__version__ = "2.3.2"
 __author__ = "Shengning Wang"
 __email__ = "snwang2023@163.com"
 __description__ = "Source-first core library for engineering surrogate modeling and operator learning"
