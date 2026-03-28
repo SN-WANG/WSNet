@@ -1,33 +1,35 @@
 # WSNet
 
+[![Role](https://img.shields.io/badge/Role-Core%20Library-2d6cdf)](https://github.com/SN-WANG/WSNet)
 [![Python](https://img.shields.io/badge/Python-3.10%2B-blue)](https://www.python.org/)
-[![PyTorch](https://img.shields.io/badge/PyTorch-supported-ee4c2c)](https://pytorch.org/)
 [![License](https://img.shields.io/badge/License-MIT-yellow)](LICENSE)
 
-**WSNet** is a compact, source-first library for engineering surrogate modeling and operator learning.  
-It keeps the reusable core of the original project: surrogate models, neural models, optimization helpers, sampling methods, training utilities, and shared runtime tools.
+**WSNet** is the core repository in this project family. It collects the reusable models, sampling methods, optimization modules, training utilities, and shared tools used across multiple engineering machine learning projects.
 
 ## 📌 Overview
 
-WSNet is designed to be cloned and used directly from the source tree.
-The goal is not to be a feature-heavy framework. The goal is to keep the core modules clean, reusable, and easy to extend across multiple engineering ML projects.
+WSNet keeps the common building blocks only.
+It is the place for code that should stay reusable across different tasks, instead of being tied to one benchmark suite or one application workflow.
 
-The current repository focuses on four things:
+The current scope includes:
 
-- reusable surrogate models
-- reusable neural and operator models
-- lightweight sampling and optimization utilities
+- classical surrogate models
+- ensemble surrogate models
+- multi-fidelity surrogate models
+- neural and operator models
+- global optimization utilities
+- DOE and infill sampling methods
 - lightweight training and utility modules
 
 ## ✨ Highlights
 
-- Classical surrogate models: `PRS`, `RBF`, `KRG`, `SVR`
-- Multi-fidelity surrogate models: `MFSMLS`, `MMFS`, `CCAMFS`
-- Ensemble surrogate models: `TAHS`, `AESMSI`
+- Classical surrogates: `PRS`, `RBF`, `KRG`, `SVR`
+- Multi-fidelity models: `MFSMLS`, `MMFS`, `CCAMFS`
+- Ensemble models: `TAHS`, `AESMSI`
 - Neural models: `MLP`, `DeepONet`, `GeoFNO`, `HyperFlowNet`, `Transolver`
-- Optimization utilities: `MIGA`, `CFSSDA`
-- Sampling utilities: LHS, single-objective infill, multi-objective infill, multi-fidelity infill
-- Training utilities for rollout-based and general learning workflows
+- Optimization helpers: `MIGA`, `CFSSDA`
+- Sampling utilities for LHS, single-objective infill, multi-objective infill, and multi-fidelity infill
+- Lightweight training utilities for general and rollout-based workflows
 
 ## 🧱 Repository Layout
 
@@ -58,14 +60,12 @@ cd WSNet
 
 ### Install the dependencies you need
 
-```bash
-pip install numpy scipy
-pip install torch
-pip install matplotlib tqdm
-```
+WSNet is meant to be used directly from the cloned source tree.
+Install the packages required by the modules you plan to use. A common setup is:
 
-WSNet is intended to be used directly from the cloned repository.
-Run your scripts from the repository root, or add the repository root to `PYTHONPATH`.
+```bash
+pip install numpy scipy torch matplotlib tqdm pyvista
+```
 
 ### Minimal example
 
@@ -84,40 +84,16 @@ y_pred, y_var = model.predict(x_train)
 print(y_pred.shape, y_var.shape)
 ```
 
-## 🧠 Module Guide
+## 🧠 Design Scope
 
-### `models/`
+WSNet is the reusable base.
+Benchmark scripts, case-specific experiments, and research-facing workflows live in sibling repositories built on top of it.
 
-The core model collection.
-This folder contains the reusable implementations of classical surrogates, multi-fidelity models, ensembles, neural models, and optimization routines.
+## 🔗 Related Repositories
 
-### `sampling/`
-
-Utilities for design of experiments and adaptive sampling.
-This includes LHS generation and infill methods for single-objective, multi-objective, and multi-fidelity settings.
-
-### `training/`
-
-Lightweight trainer code for reusable learning workflows.
-The focus is on compact training logic rather than large framework abstractions.
-
-### `utils/`
-
-Shared helpers for scaling, seeding, logging, and sweeps.
-
-## 🎯 Design Philosophy
-
-- Keep the repository small and reusable.
-- Prefer readable implementations over heavy abstractions.
-- Keep model code close to the math.
-- Use consistent `fit` / `predict` style APIs where possible.
-- Leave benchmark- and experiment-specific scripts to sibling repositories such as `SurrogateLab`.
-
-## 🔗 Related Repository
-
-If you want benchmark scripts, case studies, and research-facing experiment entry points, see **SurrogateLab**:
-
-- [SurrogateLab](https://github.com/SN-WANG/SurrogateLab)
+- [SurrogateLab](https://github.com/SN-WANG/SurrogateLab): surrogate modeling benchmarks, sampling studies, and optimization demos
+- [HyperFlowNet](https://github.com/SN-WANG/HyperFlowNet): irregular-mesh autoregressive CFD prediction
+- [StructFieldNet](https://github.com/SN-WANG/StructFieldNet): design-conditioned structural field reconstruction
 
 ## 📚 Citation
 
@@ -135,9 +111,3 @@ If WSNet is useful in your work, please cite it as a software project.
 ## 📄 License
 
 This project is released under the MIT License. See [LICENSE](LICENSE) for details.
-
-## 📬 Contact
-
-- Shengning Wang
-- Email: `snwang2023@163.com`
-- GitHub: [SN-WANG](https://github.com/SN-WANG)
