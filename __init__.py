@@ -31,7 +31,7 @@ WSNet/
 For detailed documentation and examples, please refer to the README.md file.
 """
 
-__version__ = "2.2.26"
+__version__ = "2.2.27"
 __author__ = "Shengning Wang (王晟宁)"
 __email__ = "snwang2023@163.com"
 __description__ = "A Deep Learning Library for Engineering Surrogate Modeling"

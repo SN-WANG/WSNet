@@ -4,16 +4,9 @@ This module implements the CFSSDA optimizer proposed in:
     Yuan Yongliang, "Integrated Optimization Design of Bucket-Wheel Reclaimer
     Structure and Operating Parameters", Dalian University of Technology, PhD Thesis.
 
-The Coulomb Force Search Strategy (CFSS) augments the standard Dragonfly Algorithm
-(DA, Mirjalili 2016) with gravitational-search-inspired inter-individual Coulomb
-forces, enabling faster convergence and higher solution accuracy on high-dimensional
-nonlinear problems.
-
-The public entry point ``dragonfly_optimize`` mirrors the SciPy
-``differential_evolution`` interface so it can be used as a drop-in replacement
-for constrained / unconstrained, single / multi-objective problems.
-
-Code author: Shengning Wang
+The Coulomb Force Search Strategy augments the Dragonfly Algorithm with
+inter-individual Coulomb forces, enabling efficient search on constrained,
+single-objective, and multi-objective optimization problems.
 """
 
 from __future__ import annotations
@@ -307,19 +300,14 @@ def dragonfly_optimize(
     maxiter: int = 200,
     popsize: int = 30,
     tol: float = 1e-6,
-    mutation: Optional[Union[float, Tuple[float, float]]] = None,
-    recombination: Optional[float] = None,
     seed: Optional[Union[int, np.random.Generator]] = None,
     callback: Optional[Callable[[np.ndarray, float], bool]] = None,
     disp: bool = False,
     polish: bool = False,
     init: Union[str, np.ndarray] = "random",
     atol: float = 0.0,
-    updating: str = "immediate",
-    workers: int = 1,
     constraints: Union[Sequence[Any], Any] = (),
     x0: Optional[ArrayLike] = None,
-    integrality: Optional[ArrayLike] = None,
     vectorized: bool = False,
     *,
     multi_objective: bool = False,
@@ -351,11 +339,6 @@ def dragonfly_optimize(
     individual (enemy).  When a dragonfly has no neighbours its position is
     updated via Levy flight (Eq. 3.8): X(t+1) = X(t) + Levy(d) · X(t).
 
-    The interface mirrors ``scipy.optimize.differential_evolution`` so this
-    function can be used as a drop-in replacement.  Parameters that are
-    accepted purely for API compatibility (``mutation``, ``recombination``,
-    ``updating``, ``workers``, ``integrality``) are silently ignored.
-
     Args:
         func: Objective function ``f(x, *args) -> scalar | array``.
             Input shape (n_dim,); returns a scalar for single-objective or
@@ -370,8 +353,6 @@ def dragonfly_optimize(
         tol: Relative convergence tolerance on the standard deviation of
             population energies.  Iteration stops when
             ``std(energies) <= atol + tol * |mean(energies)|``.
-        mutation: Accepted for SciPy compatibility; not used by CFSSDA.
-        recombination: Accepted for SciPy compatibility; not used by CFSSDA.
         seed: Integer seed or ``np.random.Generator`` for reproducibility.
             ``None`` uses a non-deterministic source.
         callback: Optional callable ``callback(xk, convergence) -> bool``.
@@ -384,15 +365,12 @@ def dragonfly_optimize(
             custom 2-D array of shape (n_pop, n_dim) supplying the initial
             population.
         atol: Absolute tolerance added to the convergence threshold.
-        updating: Accepted for SciPy compatibility; not used by CFSSDA.
-        workers: Accepted for SciPy compatibility; not used by CFSSDA.
         constraints: One or more constraints in any of the following forms:
             ``LinearConstraint``, ``NonlinearConstraint``, or an SLSQP-style
             dict with keys ``"type"`` and ``"fun"``.  Violated constraints are
             penalised with a growing exterior-penalty term.
         x0: Optional initial guess inserted at ``population[0]``.
             Shape: (n_dim,).  Clipped to bounds if out of range.
-        integrality: Accepted for SciPy compatibility; not enforced.
         vectorized: If ``True``, ``func`` is called with the full population
             matrix of shape (n_pop, n_dim) and must return shape (n_pop,) or
             (n_pop, n_obj).
@@ -459,9 +437,6 @@ def dragonfly_optimize(
                and kbest Coulomb force accumulation)
         Space: O(n_pop * n_dim)
     """
-    # Discard compatibility-only parameters.
-    del mutation, recombination, updating, workers, integrality
-
     # ------------------------------------------------------------------
     # 1. Initialisation – bounds, population, step vectors
     # ------------------------------------------------------------------
