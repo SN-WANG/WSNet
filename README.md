@@ -1,152 +1,143 @@
-# WSNet: A Deep Learning Library for Engineering Surrogate Modeling
+# WSNet
 
-[![Python 3.8+](https://img.shields.io/badge/python-3.8+-blue.svg)](https://www.python.org/downloads/)
-[![PyTorch](https://img.shields.io/badge/PyTorch-EE4C2C?logo=pytorch&logoColor=white)](https://pytorch.org/get-started/locally/)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+[![Python](https://img.shields.io/badge/Python-3.10%2B-blue)](https://www.python.org/)
+[![PyTorch](https://img.shields.io/badge/PyTorch-supported-ee4c2c)](https://pytorch.org/)
+[![License](https://img.shields.io/badge/License-MIT-yellow)](LICENSE)
 
-**WSNet** is an integrated deep learning library specifically designed for **high-fidelity surrogate modeling in engineering applications**. It provides a unified pipeline for **fluid dynamics emulation**, **structural analysis**, and **design optimization** with comprehensive support for classical surrogate models, neural networks, and modern neural operator algorithms.
+**WSNet** is a compact, source-first library for engineering surrogate modeling and operator learning.  
+It keeps the reusable core of the original project: surrogate models, neural models, optimization helpers, sampling methods, training utilities, and shared runtime tools.
 
-## 🏗 System Architecture
+## 📌 Overview
 
-WSNet features a completely reorganized architecture with clear separation of concerns:
+WSNet is designed to be cloned and used directly from the source tree.
+The goal is not to be a feature-heavy framework. The goal is to keep the core modules clean, reusable, and easy to extend across multiple engineering ML projects.
 
-```
-wsnet/
-├── models/        # Surrogate models (classical, neural, multi-fidelity, ensemble)
-├── training/      # Training frameworks and utilities
-├── data/          # Data loading and preprocessing
-├── sampling/      # Design of Experiments and infill strategies
-└── utils/         # Core utilities
-```
+The current repository focuses on four things:
 
-### 1. Models (`models/`)
-A modular repository of surrogate models categorized by their mathematical formulation:
+- reusable surrogate models
+- reusable neural and operator models
+- lightweight sampling and optimization utilities
+- lightweight training and utility modules
 
-* **`classical/`**: Classical response surface algorithms
-    * Includes: **PRS** (Polynomial Response Surface), **RBF** (Radial Basis Function), **KRG** (Kriging), **SVR** (Support Vector Regression)
-* **`neural/`**: Neural network models
-    * Includes: **MLP** (Multi-Layer Perceptron), **DeepONet**, **GeoFNO** (Geometry-aware Fourier Neural Operator), **HyperFlowNet**, **Transolver**
-* **`multi_fidelity/`**: Multi-fidelity models
-    * Includes: **CCA-MFS**, **MFS-MLS**, **MMFS**
-* **`ensemble/`**: Ensemble models
-    * Includes: **T-AHS**, **AES-MSI**
+## ✨ Highlights
 
-### 2. Training (`training/`)
-Training frameworks and utilities:
+- Classical surrogate models: `PRS`, `RBF`, `KRG`, `SVR`
+- Multi-fidelity surrogate models: `MFSMLS`, `MMFS`, `CCAMFS`
+- Ensemble surrogate models: `TAHS`, `AESMSI`
+- Neural models: `MLP`, `DeepONet`, `GeoFNO`, `HyperFlowNet`, `Transolver`
+- Optimization utilities: `MIGA`, `CFSSDA`
+- Sampling utilities: LHS, single-objective infill, multi-objective infill, multi-fidelity infill
+- Training utilities for rollout-based and general learning workflows
 
-* **`base_trainer.py`**: Base trainer class for custom training workflows
-* **`std_trainer.py`**: Standard trainer for static regression tasks
-* **`rollout_trainer.py`**: Trainer for autoregressive sequence prediction
-* **`teacher_forcing_trainer.py`**: Teacher forcing trainer for sequence prediction
-* **`base_criterion.py`**: Loss functions and evaluation metrics
+## 🧱 Repository Layout
 
-### 3. Data (`data/`)
-Data loading and preprocessing utilities:
-
-* **`flow_data.py`**: CFD data loading and preprocessing
-* **`scaler.py`**: Data scaling utilities (StandardScaler, MinMaxScaler)
-* **`boundary.py`**: Boundary condition detection and enforcement
-* **`flow_vis.py`**: Flow field visualization and animation
-* **`flow_plot.py`**: Training curves, error heatmaps, and metrics plots
-
-### 4. Sampling (`sampling/`)
-Design of Experiments and infill strategies:
-
-* **`doe.py`**: Design of Experiments (LHS, optimized LHS)
-* **`base_infill.py`**: Base infill sampling strategy
-* **`so_infill.py`**: Single-objective infill strategy (Expected Improvement)
-* **`mo_infill.py`**: Multi-objective infill strategy
-* **`mf_infill.py`**: Multi-fidelity infill strategy
-
-### 5. Utilities (`utils/`)
-Core utilities and helper functions:
-
-* **`seeder.py`**: Reproducibility utilities (seed everything)
-* **`hue_logger.py`**: Colored logging with ANSI formatting
-* **`sweep.py`**: Hyperparameter sweep utilities
-
-## 🚀 Key Features
-
-* **CFD-Ready Pipeline**: Direct ingestion of ANSYS Fluent data with automatic coordinate and field mapping
-* **Physics-Informed Training**: Support for physics constraints and loss functions
-* **Multi-Fidelity Support**: Comprehensive multi-fidelity modeling capabilities
-* **Ensemble Methods**: Advanced ensemble techniques for improved accuracy
-* **Neural Operator Algorithms**: Modern neural operator implementations for complex physics
-* **Comprehensive Visualization Tools**: Built-in CFD visualization and rendering
-* **Standardized API**: Consistent "initialize, fit, predict" pattern across all models
-
-## 📚 API Reference
-
-### Core Classes
-
-- `wsnet.training.base_trainer.Trainer`: Base trainer interface
-- `wsnet.data.flow_data.FlowData`: CFD data loader
-- `wsnet.sampling.doe.lhs_design`: Optimized Latin Hypercube Sampling
-
-### Common Patterns
-
-The library follows a consistent "initialize, fit, predict" pattern:
-
-```python
-# Initialize
-model = SomeModel(parameters)
-
-# Fit/Train
-trainer = SomeTrainer(model=model)
-trainer.fit(train_data, val_data)
-
-# Predict
-predictions = model.predict(test_data)
+```text
+WSNet/
+├── __init__.py
+├── models/
+│   ├── classical/
+│   ├── ensemble/
+│   ├── multi_fidelity/
+│   ├── neural/
+│   └── optimization/
+├── sampling/
+├── training/
+├── utils/
+├── README.md
+└── LICENSE
 ```
 
-## 🚀 Examples and Tutorials
+## 🚀 Getting Started
 
-Check the `examples/` directory for complete workflow examples:
-
-- **`flow_config.py`** + **`flow_train.py`**: CFD emulation pipeline (HyperFlowNet / GeoFNO / Transolver) with training, inference, and visualization
-- **`aero_config.py`** + **`aero_demo.py`**: Aerodynamic optimization benchmark platform with ensemble, multi-fidelity, sequential sampling, and optimization demos
-
-## ⚙️ Installation and Dependencies
-
-### Requirements
-
-- Python 3.8+
-- PyTorch 1.10+
-- NumPy
-- SciPy
-- Matplotlib
-- PiVista
-- tqdm
-
-### Installation
+### Clone the repository
 
 ```bash
-git clone https://github.com/SN-WANG/wsnet.git
-cd wsnet
-pip install -e .
+git clone https://github.com/SN-WANG/WSNet.git
+cd WSNet
+```
+
+### Install the dependencies you need
+
+```bash
+pip install numpy scipy
+pip install torch
+pip install matplotlib tqdm
+```
+
+WSNet is intended to be used directly from the cloned repository.
+Run your scripts from the repository root, or add the repository root to `PYTHONPATH`.
+
+### Minimal example
+
+```python
+import numpy as np
+
+from models.classical.krg import KRG
+
+x_train = np.random.rand(20, 2)
+y_train = np.sum(x_train, axis=1, keepdims=True)
+
+model = KRG()
+model.fit(x_train, y_train)
+
+y_pred, y_var = model.predict(x_train)
+print(y_pred.shape, y_var.shape)
+```
+
+## 🧠 Module Guide
+
+### `models/`
+
+The core model collection.
+This folder contains the reusable implementations of classical surrogates, multi-fidelity models, ensembles, neural models, and optimization routines.
+
+### `sampling/`
+
+Utilities for design of experiments and adaptive sampling.
+This includes LHS generation and infill methods for single-objective, multi-objective, and multi-fidelity settings.
+
+### `training/`
+
+Lightweight trainer code for reusable learning workflows.
+The focus is on compact training logic rather than large framework abstractions.
+
+### `utils/`
+
+Shared helpers for scaling, seeding, logging, and sweeps.
+
+## 🎯 Design Philosophy
+
+- Keep the repository small and reusable.
+- Prefer readable implementations over heavy abstractions.
+- Keep model code close to the math.
+- Use consistent `fit` / `predict` style APIs where possible.
+- Leave benchmark- and experiment-specific scripts to sibling repositories such as `SurrogateLab`.
+
+## 🔗 Related Repository
+
+If you want benchmark scripts, case studies, and research-facing experiment entry points, see **SurrogateLab**:
+
+- [SurrogateLab](https://github.com/SN-WANG/SurrogateLab)
+
+## 📚 Citation
+
+If WSNet is useful in your work, please cite it as a software project.
+
+```bibtex
+@software{wsnet2026,
+  author = {Shengning Wang},
+  title = {WSNet},
+  year = {2026},
+  url = {https://github.com/SN-WANG/WSNet}
+}
 ```
 
 ## 📄 License
 
-This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
+This project is released under the MIT License. See [LICENSE](LICENSE) for details.
 
-## 📞 Contact
+## 📬 Contact
 
-For questions and support, please contact:
-- Shengning Wang (王晟宁) - snwang2023@163.com
-- Project Website: [https://github.com/SN-WANG/wsnet](https://github.com/SN-WANG/wsnet)
-
-## 📖 Citation
-
-If you use WSNet in your research, please cite:
-
-```
-@software{wsnet2026,
-  author = {Shengning Wang},
-  title = {WSNet: A Deep Learning Library for Engineering Surrogate Modeling},
-  year = {2026},
-  publisher = {GitHub},
-  journal = {GitHub repository},
-  howpublished = {\url{https://github.com/SN-WANG/wsnet}}
-}
-```
+- Shengning Wang
+- Email: `snwang2023@163.com`
+- GitHub: [SN-WANG](https://github.com/SN-WANG)
