@@ -1,126 +1,115 @@
 # Transolver: Physics-Attention Neural Operator
 # Author: Shengning Wang
-#
-# Faithful reimplementation of: Wu et al., "Transolver: A Fast Transformer
-# Solver for PDEs on General Geometries", ICML 2024.
-# Source: https://github.com/thuml/Transolver
-#
-# This file provides the ORIGINAL Transolver architecture as a baseline
-# for comparison with HyperFlowNet. Uses the irregular mesh variant.
+
+import math
+from typing import List, Optional, Sequence, Tuple
 
 import torch
-from torch import nn, Tensor
+from torch import Tensor, nn
 from tqdm.auto import tqdm
-from typing import List, Optional
+
+
+ACTIVATIONS = {
+    'gelu': nn.GELU,
+    'tanh': nn.Tanh,
+    'sigmoid': nn.Sigmoid,
+    'relu': nn.ReLU,
+    'leaky_relu': lambda: nn.LeakyReLU(0.1),
+    'softplus': nn.Softplus,
+    'elu': nn.ELU,
+    'silu': nn.SiLU,
+}
+
+
+def _build_activation(name: str) -> nn.Module:
+    key = name.lower()
+    if key not in ACTIVATIONS:
+        raise NotImplementedError(f'Unsupported activation: {name}')
+    factory = ACTIVATIONS[key]
+    return factory() if isinstance(factory, type) else factory()
 
 
 def _trunc_normal_(tensor: Tensor, std: float = 0.02) -> Tensor:
-    """Truncated normal initialization (compatible replacement for timm).
-
-    Fills tensor in-place from a truncated normal distribution
-    with mean=0 and the given std. Values beyond 2*std are resampled.
-
-    Args:
-        tensor: Tensor to initialize in-place.
-        std: Standard deviation of the normal distribution.
-
-    Returns:
-        The initialized tensor (same object, modified in-place).
-    """
     with torch.no_grad():
-        tensor.normal_(0, std)
-        # Clamp to [-2*std, 2*std] and resample outliers
+        tensor.normal_(0.0, std)
         while True:
             mask = tensor.abs() > 2 * std
             if not mask.any():
                 break
-            tensor[mask] = torch.empty_like(tensor[mask]).normal_(0, std)
+            tensor[mask] = torch.empty_like(tensor[mask]).normal_(0.0, std)
     return tensor
 
 
+def timestep_embedding(timesteps: Tensor, dim: int, max_period: int = 10000) -> Tensor:
+    """
+    Build sinusoidal timestep embeddings.
+
+    Args:
+        timesteps (Tensor): Time indices with shape (batch_size,) and dtype float32-compatible.
+        dim (int): Embedding dimension.
+        max_period (int): Minimum frequency control used by the original implementation.
+
+    Returns:
+        Tensor: Time embeddings with shape (batch_size, dim) and dtype float32.
+    """
+    half_dim = dim // 2
+    freqs = torch.exp(
+        -math.log(max_period) * torch.arange(half_dim, dtype=torch.float32, device=timesteps.device) / max(half_dim, 1)
+    )
+    angles = timesteps[:, None].float() * freqs[None, :]
+    embedding = torch.cat([torch.cos(angles), torch.sin(angles)], dim=-1)
+    if dim % 2 == 1:
+        embedding = torch.cat([embedding, torch.zeros_like(embedding[:, :1])], dim=-1)
+    return embedding
+
+
 # ============================================================
-# MLP (with optional residual connections)
+# MLP
 # ============================================================
 
-class MLP(nn.Module):
-    """Multi-layer perceptron with optional residual connections.
 
-    Architecture:
-        Linear(in) -> act -> [Linear(hidden) -> act (+ residual)] * n_layers -> Linear(out)
-
-    When res=True, each hidden layer adds its output to its input (pre-activation
-    residual). This matches the original Transolver MLP implementation.
+class TransolverMLP(nn.Module):
+    """
+    MLP used by the original Transolver blocks.
     """
 
-    def __init__(self, n_input: int, n_hidden: int, n_output: int,
-                 n_layers: int = 1, res: bool = True):
-        """
-        Args:
-            n_input: Input feature dimension.
-            n_hidden: Hidden layer dimension.
-            n_output: Output feature dimension.
-            n_layers: Number of hidden residual layers (after the pre-projection).
-            res: Whether to use residual connections in hidden layers.
-        """
+    def __init__(
+        self,
+        in_channels: int,
+        hidden_channels: int,
+        out_channels: int,
+        n_layers: int = 1,
+        act: str = 'gelu',
+        res: bool = True,
+    ):
         super().__init__()
         self.n_layers = n_layers
         self.res = res
-        self.linear_pre = nn.Sequential(nn.Linear(n_input, n_hidden), nn.GELU())
-        self.linear_post = nn.Linear(n_hidden, n_output)
-        self.linears = nn.ModuleList([
-            nn.Sequential(nn.Linear(n_hidden, n_hidden), nn.GELU())
+        self.linear_pre = nn.Sequential(nn.Linear(in_channels, hidden_channels), _build_activation(act))
+        self.linear_post = nn.Linear(hidden_channels, out_channels)
+        self.hidden_layers = nn.ModuleList([
+            nn.Sequential(nn.Linear(hidden_channels, hidden_channels), _build_activation(act))
             for _ in range(n_layers)
         ])
 
     def forward(self, x: Tensor) -> Tensor:
-        """
-        Args:
-            x: Input tensor. Shape: (..., n_input).
-
-        Returns:
-            Output tensor. Shape: (..., n_output).
-        """
         x = self.linear_pre(x)
-        for i in range(self.n_layers):
-            if self.res:
-                x = self.linears[i](x) + x
-            else:
-                x = self.linears[i](x)
-        x = self.linear_post(x)
-        return x
+        for layer in self.hidden_layers:
+            x = layer(x) + x if self.res else layer(x)
+        return self.linear_post(x)
 
 
 # ============================================================
-# Physics Attention (Irregular Mesh)
+# Physics Attention
 # ============================================================
 
-class PhysicsAttention(nn.Module):
-    """Physics-aware slice attention for irregular meshes.
 
-    The mechanism has three stages:
-        1. **Slice**: Soft-cluster N mesh nodes into G slice tokens via learned
-           coordinate-based weights. Features and coordinates are projected
-           separately (in_project_fx, in_project_x), then the coordinate
-           projection drives the slicing weights through a temperature-scaled
-           softmax.
-        2. **Attend**: Standard multi-head self-attention among the G slice
-           tokens (Q/K/V projections, scaled dot-product).
-        3. **Deslice**: Broadcast attended slice tokens back to N nodes using
-           the same slicing weights.
-
-    Complexity: O(N * G * D + G^2 * D) per head, where N = nodes, G = slices,
-    D = dim_head. For N >> G this is much cheaper than O(N^2 * D).
-
-    Args:
-        dim: Model hidden dimension (input and output).
-        num_heads: Number of attention heads.
-        dim_head: Dimension per head. inner_dim = num_heads * dim_head.
-        dropout: Dropout probability on attention weights and output.
-        num_slices: Number of physics-informed slice tokens (G).
+class PhysicsAttentionIrregularMesh(nn.Module):
+    """
+    Physics Attention for irregular meshes.
     """
 
-    def __init__(self, dim: int, num_heads: int = 8, dim_head: int = 64,
-                 dropout: float = 0.0, num_slices: int = 64):
+    def __init__(self, dim: int, num_heads: int = 8, dim_head: int = 64, dropout: float = 0.0, num_slices: int = 64):
         super().__init__()
         inner_dim = dim_head * num_heads
         self.dim_head = dim_head
@@ -128,162 +117,295 @@ class PhysicsAttention(nn.Module):
         self.scale = dim_head ** -0.5
         self.softmax = nn.Softmax(dim=-1)
         self.dropout = nn.Dropout(dropout)
-
-        # Learnable temperature parameter, clamped to [0.1, 5] during forward
         self.temperature = nn.Parameter(torch.ones(1, num_heads, 1, 1) * 0.5)
 
-        # Separate projections for features and coordinates
         self.in_project_x = nn.Linear(dim, inner_dim)
         self.in_project_fx = nn.Linear(dim, inner_dim)
-
-        # Slice projection: maps each head's dim_head -> num_slices
         self.in_project_slice = nn.Linear(dim_head, num_slices)
         nn.init.orthogonal_(self.in_project_slice.weight)
 
-        # Q / K / V projections on slice tokens
         self.to_q = nn.Linear(dim_head, dim_head, bias=False)
         self.to_k = nn.Linear(dim_head, dim_head, bias=False)
         self.to_v = nn.Linear(dim_head, dim_head, bias=False)
-
-        # Output projection
-        self.to_out = nn.Sequential(
-            nn.Linear(inner_dim, dim),
-            nn.Dropout(dropout),
-        )
+        self.to_out = nn.Sequential(nn.Linear(inner_dim, dim), nn.Dropout(dropout))
 
     def forward(self, x: Tensor) -> Tensor:
-        """Apply physics-attention to irregular mesh features.
+        batch_size, num_nodes, _ = x.shape
 
-        Args:
-            x: Node features. Shape: (B, N, C) where C = dim.
+        fx_mid = self.in_project_fx(x).reshape(batch_size, num_nodes, self.num_heads, self.dim_head)
+        fx_mid = fx_mid.permute(0, 2, 1, 3).contiguous()
+        x_mid = self.in_project_x(x).reshape(batch_size, num_nodes, self.num_heads, self.dim_head)
+        x_mid = x_mid.permute(0, 2, 1, 3).contiguous()
 
-        Returns:
-            Attended features. Shape: (B, N, C).
-        """
-        B, N, C = x.shape
-        H, D = self.num_heads, self.dim_head
+        slice_weights = self.softmax(self.in_project_slice(x_mid) / self.temperature)
+        slice_norm = slice_weights.sum(dim=2)
+        slice_token = torch.einsum('bhnc,bhng->bhgc', fx_mid, slice_weights)
+        slice_token = slice_token / (slice_norm[..., None] + 1e-5)
 
-        # --- (1) Slice: soft-cluster N nodes into G slice tokens ---
-        # Feature projection -> (B, H, N, D)
-        fx_mid = self.in_project_fx(x).reshape(B, N, H, D).permute(0, 2, 1, 3).contiguous()
-        # Coordinate projection -> (B, H, N, D)
-        x_mid = self.in_project_x(x).reshape(B, N, H, D).permute(0, 2, 1, 3).contiguous()
-
-        # Slice weights: (B, H, N, G), temperature-scaled softmax
-        temp = torch.clamp(self.temperature, min=0.1, max=5.0)
-        slice_weights = self.softmax(self.in_project_slice(x_mid) / temp)  # (B, H, N, G)
-
-        # Weighted aggregation: (B, H, G, D)
-        slice_norm = slice_weights.sum(dim=2)  # (B, H, G)
-        slice_token = torch.einsum("bhnc,bhng->bhgc", fx_mid, slice_weights)
-        slice_token = slice_token / (slice_norm.unsqueeze(-1) + 1e-5)
-
-        # --- (2) Attention among slice tokens ---
-        q = self.to_q(slice_token)  # (B, H, G, D)
-        k = self.to_k(slice_token)
-        v = self.to_v(slice_token)
-
-        dots = torch.matmul(q, k.transpose(-1, -2)) * self.scale  # (B, H, G, G)
-        attn = self.softmax(dots)
+        q_slice = self.to_q(slice_token)
+        k_slice = self.to_k(slice_token)
+        v_slice = self.to_v(slice_token)
+        attn = self.softmax(torch.matmul(q_slice, k_slice.transpose(-1, -2)) * self.scale)
         attn = self.dropout(attn)
-        out_slice = torch.matmul(attn, v)  # (B, H, G, D)
+        out_slice = torch.matmul(attn, v_slice)
 
-        # --- (3) Deslice: broadcast back to N nodes ---
-        out_x = torch.einsum("bhgc,bhng->bhnc", out_slice, slice_weights)  # (B, H, N, D)
-        out_x = out_x.permute(0, 2, 1, 3).reshape(B, N, H * D)  # (B, N, inner_dim)
-        return self.to_out(out_x)
+        out = torch.einsum('bhgc,bhng->bhnc', out_slice, slice_weights)
+        out = out.permute(0, 2, 1, 3).reshape(batch_size, num_nodes, -1)
+        return self.to_out(out)
+
+
+class PhysicsAttentionStructuredMesh2D(nn.Module):
+    """
+    Physics Attention for structured 2D meshes.
+    """
+
+    def __init__(
+        self,
+        dim: int,
+        num_heads: int = 8,
+        dim_head: int = 64,
+        dropout: float = 0.0,
+        num_slices: int = 64,
+        num_rows: int = 85,
+        num_cols: int = 85,
+        kernel_size: int = 3,
+    ):
+        super().__init__()
+        inner_dim = dim_head * num_heads
+        self.dim_head = dim_head
+        self.num_heads = num_heads
+        self.scale = dim_head ** -0.5
+        self.softmax = nn.Softmax(dim=-1)
+        self.dropout = nn.Dropout(dropout)
+        self.temperature = nn.Parameter(torch.ones(1, num_heads, 1, 1) * 0.5)
+        self.num_rows = num_rows
+        self.num_cols = num_cols
+
+        self.in_project_x = nn.Conv2d(dim, inner_dim, kernel_size, 1, kernel_size // 2)
+        self.in_project_fx = nn.Conv2d(dim, inner_dim, kernel_size, 1, kernel_size // 2)
+        self.in_project_slice = nn.Linear(dim_head, num_slices)
+        nn.init.orthogonal_(self.in_project_slice.weight)
+
+        self.to_q = nn.Linear(dim_head, dim_head, bias=False)
+        self.to_k = nn.Linear(dim_head, dim_head, bias=False)
+        self.to_v = nn.Linear(dim_head, dim_head, bias=False)
+        self.to_out = nn.Sequential(nn.Linear(inner_dim, dim), nn.Dropout(dropout))
+
+    def forward(self, x: Tensor) -> Tensor:
+        batch_size, num_nodes, num_channels = x.shape
+        expected_nodes = self.num_rows * self.num_cols
+        if num_nodes != expected_nodes:
+            raise ValueError(f'Expected {expected_nodes} nodes for mesh_size=({self.num_rows}, {self.num_cols}), got {num_nodes}')
+
+        x = x.reshape(batch_size, self.num_rows, self.num_cols, num_channels).permute(0, 3, 1, 2).contiguous()
+
+        fx_mid = self.in_project_fx(x).permute(0, 2, 3, 1).reshape(batch_size, num_nodes, self.num_heads, self.dim_head)
+        fx_mid = fx_mid.permute(0, 2, 1, 3).contiguous()
+        x_mid = self.in_project_x(x).permute(0, 2, 3, 1).reshape(batch_size, num_nodes, self.num_heads, self.dim_head)
+        x_mid = x_mid.permute(0, 2, 1, 3).contiguous()
+
+        temperature = torch.clamp(self.temperature, min=0.1, max=5.0)
+        slice_weights = self.softmax(self.in_project_slice(x_mid) / temperature)
+        slice_norm = slice_weights.sum(dim=2)
+        slice_token = torch.einsum('bhnc,bhng->bhgc', fx_mid, slice_weights)
+        slice_token = slice_token / (slice_norm[..., None] + 1e-5)
+
+        q_slice = self.to_q(slice_token)
+        k_slice = self.to_k(slice_token)
+        v_slice = self.to_v(slice_token)
+        attn = self.softmax(torch.matmul(q_slice, k_slice.transpose(-1, -2)) * self.scale)
+        attn = self.dropout(attn)
+        out_slice = torch.matmul(attn, v_slice)
+
+        out = torch.einsum('bhgc,bhng->bhnc', out_slice, slice_weights)
+        out = out.permute(0, 2, 1, 3).reshape(batch_size, num_nodes, -1)
+        return self.to_out(out)
+
+
+class PhysicsAttentionStructuredMesh3D(nn.Module):
+    """
+    Physics Attention for structured 3D meshes.
+    """
+
+    def __init__(
+        self,
+        dim: int,
+        num_heads: int = 8,
+        dim_head: int = 64,
+        dropout: float = 0.0,
+        num_slices: int = 32,
+        num_rows: int = 32,
+        num_cols: int = 32,
+        num_depth: int = 32,
+        kernel_size: int = 3,
+    ):
+        super().__init__()
+        inner_dim = dim_head * num_heads
+        self.dim_head = dim_head
+        self.num_heads = num_heads
+        self.scale = dim_head ** -0.5
+        self.softmax = nn.Softmax(dim=-1)
+        self.dropout = nn.Dropout(dropout)
+        self.temperature = nn.Parameter(torch.ones(1, num_heads, 1, 1) * 0.5)
+        self.num_rows = num_rows
+        self.num_cols = num_cols
+        self.num_depth = num_depth
+
+        self.in_project_x = nn.Conv3d(dim, inner_dim, kernel_size, 1, kernel_size // 2)
+        self.in_project_fx = nn.Conv3d(dim, inner_dim, kernel_size, 1, kernel_size // 2)
+        self.in_project_slice = nn.Linear(dim_head, num_slices)
+        nn.init.orthogonal_(self.in_project_slice.weight)
+
+        self.to_q = nn.Linear(dim_head, dim_head, bias=False)
+        self.to_k = nn.Linear(dim_head, dim_head, bias=False)
+        self.to_v = nn.Linear(dim_head, dim_head, bias=False)
+        self.to_out = nn.Sequential(nn.Linear(inner_dim, dim), nn.Dropout(dropout))
+
+    def forward(self, x: Tensor) -> Tensor:
+        batch_size, num_nodes, num_channels = x.shape
+        expected_nodes = self.num_rows * self.num_cols * self.num_depth
+        if num_nodes != expected_nodes:
+            raise ValueError(
+                f'Expected {expected_nodes} nodes for mesh_size=({self.num_rows}, {self.num_cols}, {self.num_depth}), '
+                f'got {num_nodes}'
+            )
+
+        x = x.reshape(batch_size, self.num_rows, self.num_cols, self.num_depth, num_channels)
+        x = x.permute(0, 4, 1, 2, 3).contiguous()
+
+        fx_mid = self.in_project_fx(x).permute(0, 2, 3, 4, 1)
+        fx_mid = fx_mid.reshape(batch_size, num_nodes, self.num_heads, self.dim_head).permute(0, 2, 1, 3).contiguous()
+        x_mid = self.in_project_x(x).permute(0, 2, 3, 4, 1)
+        x_mid = x_mid.reshape(batch_size, num_nodes, self.num_heads, self.dim_head).permute(0, 2, 1, 3).contiguous()
+
+        temperature = torch.clamp(self.temperature, min=0.1, max=5.0)
+        slice_weights = self.softmax(self.in_project_slice(x_mid) / temperature)
+        slice_norm = slice_weights.sum(dim=2)
+        slice_token = torch.einsum('bhnc,bhng->bhgc', fx_mid, slice_weights)
+        slice_token = slice_token / (slice_norm[..., None] + 1e-5)
+
+        q_slice = self.to_q(slice_token)
+        k_slice = self.to_k(slice_token)
+        v_slice = self.to_v(slice_token)
+        attn = self.softmax(torch.matmul(q_slice, k_slice.transpose(-1, -2)) * self.scale)
+        attn = self.dropout(attn)
+        out_slice = torch.matmul(attn, v_slice)
+
+        out = torch.einsum('bhgc,bhng->bhnc', out_slice, slice_weights)
+        out = out.permute(0, 2, 1, 3).reshape(batch_size, num_nodes, -1)
+        return self.to_out(out)
 
 
 # ============================================================
 # Transolver Block
 # ============================================================
 
+
 class TransolverBlock(nn.Module):
-    """Single Transolver encoder block.
-
-    Architecture:
-        x -> LayerNorm -> PhysicsAttention -> (+residual)
-          -> LayerNorm -> MLP              -> (+residual)
-        [if last_layer: -> LayerNorm -> Linear(out_channels)]
-
-    The MLP uses 0 hidden residual layers (just pre-linear + GELU + post-linear),
-    matching the original implementation (n_layers=0, res=False).
-
-    Args:
-        num_heads: Number of attention heads.
-        hidden_dim: Model width (hidden dimension).
-        dropout: Dropout probability.
-        mlp_ratio: MLP hidden dimension multiplier.
-        last_layer: If True, append a final LayerNorm + Linear output head.
-        out_channels: Output dimension for the last layer projection.
-        num_slices: Number of physics-informed slice tokens.
+    """
+    One Transolver block with pre-norm attention and feedforward residuals.
     """
 
-    def __init__(self, num_heads: int, hidden_dim: int, dropout: float,
-                 mlp_ratio: int = 4, last_layer: bool = False,
-                 out_channels: int = 1, num_slices: int = 32):
+    def __init__(
+        self,
+        hidden_dim: int,
+        num_heads: int,
+        dropout: float,
+        act: str = 'gelu',
+        mlp_ratio: int = 4,
+        num_slices: int = 32,
+        mesh_type: str = 'irregular',
+        spatial_dim: int = 2,
+        mesh_size: Optional[Sequence[int]] = None,
+        kernel_size: int = 3,
+        last_layer: bool = False,
+        out_channels: int = 1,
+    ):
         super().__init__()
         self.last_layer = last_layer
+        self.norm1 = nn.LayerNorm(hidden_dim)
+        self.norm2 = nn.LayerNorm(hidden_dim)
+        self.mlp = TransolverMLP(hidden_dim, hidden_dim * mlp_ratio, hidden_dim, n_layers=0, act=act, res=False)
 
-        self.ln_1 = nn.LayerNorm(hidden_dim)
-        self.attn = PhysicsAttention(
-            dim=hidden_dim,
-            num_heads=num_heads,
-            dim_head=hidden_dim // num_heads,
-            dropout=dropout,
-            num_slices=num_slices,
-        )
-
-        self.ln_2 = nn.LayerNorm(hidden_dim)
-        self.mlp = MLP(hidden_dim, hidden_dim * mlp_ratio, hidden_dim,
-                        n_layers=0, res=False)
+        if mesh_type == 'irregular':
+            self.attn = PhysicsAttentionIrregularMesh(
+                dim=hidden_dim,
+                num_heads=num_heads,
+                dim_head=hidden_dim // num_heads,
+                dropout=dropout,
+                num_slices=num_slices,
+            )
+        elif mesh_type == 'structured':
+            if mesh_size is None:
+                raise ValueError('mesh_size must be provided when mesh_type="structured"')
+            if spatial_dim == 2:
+                self.attn = PhysicsAttentionStructuredMesh2D(
+                    dim=hidden_dim,
+                    num_heads=num_heads,
+                    dim_head=hidden_dim // num_heads,
+                    dropout=dropout,
+                    num_slices=num_slices,
+                    num_rows=int(mesh_size[0]),
+                    num_cols=int(mesh_size[1]),
+                    kernel_size=kernel_size,
+                )
+            elif spatial_dim == 3:
+                self.attn = PhysicsAttentionStructuredMesh3D(
+                    dim=hidden_dim,
+                    num_heads=num_heads,
+                    dim_head=hidden_dim // num_heads,
+                    dropout=dropout,
+                    num_slices=num_slices,
+                    num_rows=int(mesh_size[0]),
+                    num_cols=int(mesh_size[1]),
+                    num_depth=int(mesh_size[2]),
+                    kernel_size=kernel_size,
+                )
+            else:
+                raise ValueError(f'structured mesh only supports spatial_dim=2 or 3, got {spatial_dim}')
+        else:
+            raise ValueError(f'Unsupported mesh_type: {mesh_type}')
 
         if self.last_layer:
-            self.ln_3 = nn.LayerNorm(hidden_dim)
+            self.norm3 = nn.LayerNorm(hidden_dim)
             self.out_proj = nn.Linear(hidden_dim, out_channels)
 
-    def forward(self, fx: Tensor) -> Tensor:
-        """
-        Args:
-            fx: Node features. Shape: (B, N, hidden_dim).
-
-        Returns:
-            If last_layer: output predictions. Shape: (B, N, out_channels).
-            Otherwise: updated features. Shape: (B, N, hidden_dim).
-        """
-        fx = self.attn(self.ln_1(fx)) + fx
-        fx = self.mlp(self.ln_2(fx)) + fx
+    def forward(self, x: Tensor) -> Tensor:
+        x = x + self.attn(self.norm1(x))
+        x = x + self.mlp(self.norm2(x))
         if self.last_layer:
-            return self.out_proj(self.ln_3(fx))
-        return fx
+            return self.out_proj(self.norm3(x))
+        return x
 
 
 # ============================================================
-# Transolver (Irregular Mesh Variant)
+# Transolver
 # ============================================================
+
 
 class Transolver(nn.Module):
-    """Transolver: A Fast Transformer Solver for PDEs on General Geometries.
-
-    This is the irregular mesh variant (no convolution layers). The pipeline is:
-        1. Concatenate input_features and physical_coords -> (B, N, in_channels + spatial_dim)
-        2. MLP preprocessing: project to hidden width
-        3. Add learnable placeholder bias
-        4. Pass through a stack of TransolverBlocks (last block produces output)
-
-    Complexity per layer: O(N * G * C + G^2 * C), where N = nodes,
-    G = num_slices, C = width. Total: O(depth * (N * G * C + G^2 * C)).
+    """
+    WSNet-style Transolver implementation aligned with the original repository.
 
     Args:
-        in_channels: Number of input feature channels per node.
-        out_channels: Number of output channels per node.
-        spatial_dim: Spatial dimensionality of the mesh (1, 2, or 3).
-        width: Hidden dimension throughout the transformer.
-        depth: Number of TransolverBlocks.
-        num_slices: Number of physics-informed slice tokens per attention layer.
-        num_heads: Number of attention heads.
-        mlp_ratio: MLP hidden dimension multiplier within each block.
-        dropout: Dropout probability.
+        in_channels (int): Input feature dimension with shape (batch_size, num_nodes, in_channels).
+        out_channels (int): Output feature dimension with shape (batch_size, num_nodes, out_channels).
+        spatial_dim (int): Coordinate dimension.
+        width (int): Hidden channel width.
+        depth (int): Number of Transolver blocks.
+        num_slices (int): Number of slice tokens in Physics Attention.
+        num_heads (int): Number of attention heads.
+        mlp_ratio (int): Hidden expansion ratio inside each block MLP.
+        dropout (float): Dropout rate used by attention outputs.
+        act (str): Activation name used by the original MLP.
+        use_time_input (bool): Whether to add original timestep embeddings.
+        unified_pos (bool): Whether to replace raw coordinates with unified position distances.
+        ref (int): Number of reference points per spatial axis for unified_pos.
+        mesh_type (str): Either 'irregular' or 'structured'.
+        mesh_size (Optional[Sequence[int]]): Structured mesh resolution for 2D or 3D attention.
+        kernel_size (int): Structured mesh convolution kernel size.
+        ref_bounds (Optional[Sequence[Tuple[float, float]]]): Reference coordinate bounds for unified_pos.
+        append_coords_when_unified (bool): If True, concatenate raw coordinates before unified_pos distances.
     """
 
     def __init__(
@@ -292,135 +414,268 @@ class Transolver(nn.Module):
         out_channels: int,
         spatial_dim: int,
         width: int = 256,
-        depth: int = 8,
+        depth: int = 5,
         num_slices: int = 32,
         num_heads: int = 8,
         mlp_ratio: int = 1,
         dropout: float = 0.0,
+        act: str = 'gelu',
+        use_time_input: bool = False,
+        unified_pos: bool = False,
+        ref: int = 8,
+        mesh_type: str = 'irregular',
+        mesh_size: Optional[Sequence[int]] = None,
+        kernel_size: int = 3,
+        ref_bounds: Optional[Sequence[Tuple[float, float]]] = None,
+        append_coords_when_unified: bool = False,
     ):
         super().__init__()
+        if width % num_heads != 0:
+            raise ValueError(f'width={width} must be divisible by num_heads={num_heads}')
+
+        mesh_type = mesh_type.lower()
+        if mesh_type not in {'irregular', 'structured'}:
+            raise ValueError(f'Unsupported mesh_type: {mesh_type}')
+
+        if mesh_type == 'structured':
+            if mesh_size is None:
+                raise ValueError('mesh_size must be provided when mesh_type="structured"')
+            if spatial_dim not in (2, 3):
+                raise ValueError(f'structured mesh only supports spatial_dim=2 or 3, got {spatial_dim}')
+            if len(mesh_size) != spatial_dim:
+                raise ValueError(f'mesh_size must have {spatial_dim} entries, got {len(mesh_size)}')
+            mesh_size = tuple(int(size) for size in mesh_size)
+
+        self.__name__ = 'Transolver'
         self.in_channels = in_channels
         self.out_channels = out_channels
         self.spatial_dim = spatial_dim
         self.width = width
         self.depth = depth
+        self.num_slices = num_slices
+        self.num_heads = num_heads
+        self.mlp_ratio = mlp_ratio
+        self.dropout = dropout
+        self.act = act
+        self.use_time_input = use_time_input
+        self.unified_pos = unified_pos
+        self.ref = ref
+        self.mesh_type = mesh_type
+        self.mesh_size = mesh_size
+        self.kernel_size = kernel_size
+        self.append_coords_when_unified = append_coords_when_unified
+        self.ref_bounds = self._normalize_ref_bounds(ref_bounds)
+        self.num_ref_points = ref ** spatial_dim
 
-        # Preprocessing MLP: raw (features || coords) -> hidden width
-        # 2-layer MLP with residual: Linear -> GELU -> [Linear -> GELU + res] -> Linear
-        self.preprocess = MLP(
-            in_channels + spatial_dim,
-            width * 2,
-            width,
+        coord_dim = self.num_ref_points if unified_pos else spatial_dim
+        if unified_pos and append_coords_when_unified:
+            coord_dim += spatial_dim
+
+        self.preprocess = TransolverMLP(
+            in_channels=in_channels + coord_dim,
+            hidden_channels=width * 2,
+            out_channels=width,
             n_layers=0,
+            act=act,
             res=False,
         )
 
-        # Learnable placeholder bias added to all node features after preprocessing
-        self.placeholder = nn.Parameter(
-            (1.0 / width) * torch.rand(width, dtype=torch.float)
-        )
+        if use_time_input:
+            self.time_fc = nn.Sequential(nn.Linear(width, width), nn.SiLU(), nn.Linear(width, width))
+        else:
+            self.time_fc = None
 
-        # Stack of TransolverBlocks; the last block includes output projection
         self.blocks = nn.ModuleList([
             TransolverBlock(
-                num_heads=num_heads,
                 hidden_dim=width,
+                num_heads=num_heads,
                 dropout=dropout,
+                act=act,
                 mlp_ratio=mlp_ratio,
-                out_channels=out_channels,
                 num_slices=num_slices,
-                last_layer=(i == depth - 1),
+                mesh_type=mesh_type,
+                spatial_dim=spatial_dim,
+                mesh_size=mesh_size,
+                kernel_size=kernel_size,
+                last_layer=(layer_index == depth - 1),
+                out_channels=out_channels,
             )
-            for i in range(depth)
+            for layer_index in range(depth)
         ])
 
-        # Weight initialization
+        self.placeholder = nn.Parameter((1.0 / width) * torch.rand(width, dtype=torch.float32))
+
+        structured_pos = None
+        if self.mesh_type == 'structured' and self.unified_pos:
+            structured_pos = self._build_structured_unified_pos(device=torch.device('cpu'), dtype=torch.float32)
+        self.register_buffer('structured_pos', structured_pos, persistent=False)
+
         self._initialize_weights()
 
+    def _normalize_ref_bounds(
+        self,
+        ref_bounds: Optional[Sequence[Tuple[float, float]]],
+    ) -> Tuple[Tuple[float, float], ...]:
+        if ref_bounds is None:
+            return tuple((0.0, 1.0) for _ in range(self.spatial_dim))
+        if len(ref_bounds) != self.spatial_dim:
+            raise ValueError(f'ref_bounds must have {self.spatial_dim} entries, got {len(ref_bounds)}')
+        return tuple((float(lower), float(upper)) for lower, upper in ref_bounds)
+
     def _initialize_weights(self) -> None:
-        """Apply truncated normal init to Linear layers, constant init to LayerNorm."""
         self.apply(self._init_weights)
 
     @staticmethod
-    def _init_weights(m: nn.Module) -> None:
-        """Per-module weight initialization callback.
+    def _init_weights(module: nn.Module) -> None:
+        if isinstance(module, nn.Linear):
+            _trunc_normal_(module.weight, std=0.02)
+            if module.bias is not None:
+                nn.init.constant_(module.bias, 0.0)
+        elif isinstance(module, (nn.LayerNorm, nn.BatchNorm1d)):
+            nn.init.constant_(module.bias, 0.0)
+            nn.init.constant_(module.weight, 1.0)
 
-        - Linear: trunc_normal_(weight, std=0.02), zeros_(bias).
-        - LayerNorm / BatchNorm1d: ones_(weight), zeros_(bias).
-        """
-        if isinstance(m, nn.Linear):
-            _trunc_normal_(m.weight, std=0.02)
-            if m.bias is not None:
-                nn.init.constant_(m.bias, 0)
-        elif isinstance(m, (nn.LayerNorm, nn.BatchNorm1d)):
-            nn.init.constant_(m.bias, 0)
-            nn.init.constant_(m.weight, 1.0)
+    def _build_reference_points(self, device: torch.device, dtype: torch.dtype) -> Tensor:
+        axes = [
+            torch.linspace(lower, upper, self.ref, device=device, dtype=dtype)
+            for lower, upper in self.ref_bounds
+        ]
+        mesh = torch.meshgrid(*axes, indexing='ij')
+        return torch.stack(mesh, dim=-1).reshape(-1, self.spatial_dim)
+
+    def _build_structured_unified_pos(self, device: torch.device, dtype: torch.dtype) -> Tensor:
+        axes = [
+            torch.linspace(lower, upper, size, device=device, dtype=dtype)
+            for size, (lower, upper) in zip(self.mesh_size, self.ref_bounds)
+        ]
+        mesh = torch.meshgrid(*axes, indexing='ij')
+        mesh_points = torch.stack(mesh, dim=-1).reshape(-1, self.spatial_dim)
+        ref_points = self._build_reference_points(device=device, dtype=dtype)
+        return torch.sqrt(torch.sum((mesh_points[:, None, :] - ref_points[None, :, :]) ** 2, dim=-1))
+
+    def _validate_inputs(self, input_features: Optional[Tensor], physical_coords: Optional[Tensor]) -> None:
+        if input_features is None and self.in_channels != 0:
+            raise ValueError(f'Expected input_features with last dimension {self.in_channels}, but got None')
+
+        if input_features is not None and input_features.shape[-1] != self.in_channels:
+            raise ValueError(
+                f'Expected input_features.shape[-1] == {self.in_channels}, got {input_features.shape[-1]}'
+            )
+
+        if physical_coords is not None and physical_coords.shape[-1] != self.spatial_dim:
+            raise ValueError(
+                f'Expected physical_coords.shape[-1] == {self.spatial_dim}, got {physical_coords.shape[-1]}'
+            )
+
+        if self.mesh_type == 'structured':
+            expected_nodes = math.prod(self.mesh_size)
+            if input_features is not None and input_features.shape[1] != expected_nodes:
+                raise ValueError(
+                    f'Expected input_features.shape[1] == {expected_nodes} for mesh_size={self.mesh_size}, '
+                    f'got {input_features.shape[1]}'
+                )
+            if physical_coords is not None and physical_coords.shape[1] != expected_nodes:
+                raise ValueError(
+                    f'Expected physical_coords.shape[1] == {expected_nodes} for mesh_size={self.mesh_size}, '
+                    f'got {physical_coords.shape[1]}'
+                )
+
+    def _get_coordinate_features(self, input_features: Optional[Tensor], physical_coords: Optional[Tensor]) -> Tensor:
+        reference = physical_coords if physical_coords is not None else input_features
+        if reference is None:
+            raise ValueError('At least one of input_features or physical_coords must be provided')
+
+        batch_size = reference.shape[0]
+        device = reference.device
+        dtype = reference.dtype
+
+        if not self.unified_pos:
+            if physical_coords is None:
+                raise ValueError('physical_coords is required when unified_pos=False')
+            return physical_coords
+
+        if self.mesh_type == 'structured':
+            if self.structured_pos is None:
+                raise RuntimeError('structured_pos cache was not initialized')
+            coord_features = self.structured_pos.to(device=device, dtype=dtype).unsqueeze(0).expand(batch_size, -1, -1)
+        else:
+            if physical_coords is None:
+                raise ValueError('physical_coords is required when mesh_type="irregular" and unified_pos=True')
+            ref_points = self._build_reference_points(device=device, dtype=dtype)
+            coord_features = torch.sqrt(
+                torch.sum((physical_coords[:, :, None, :] - ref_points[None, None, :, :]) ** 2, dim=-1)
+            )
+
+        if self.append_coords_when_unified:
+            if physical_coords is None:
+                raise ValueError('physical_coords is required when append_coords_when_unified=True')
+            coord_features = torch.cat([physical_coords, coord_features], dim=-1)
+
+        return coord_features
 
     def forward(
         self,
-        input_features: Tensor,
-        physical_coords: Tensor,
+        input_features: Optional[Tensor],
+        physical_coords: Optional[Tensor],
         t_norm: Optional[Tensor] = None,
         **kwargs,
     ) -> Tensor:
-        """Forward pass for single-step prediction.
+        """
+        Forward pass on node features.
 
         Args:
-            input_features: Per-node input features.
-                Shape: (B, N, in_channels).
-            physical_coords: Node spatial coordinates.
-                Shape: (B, N, spatial_dim).
-            t_norm: Normalized time step (unused in the original Transolver,
-                accepted for interface compatibility). Shape: (B,).
-            **kwargs: Additional keyword arguments (ignored).
+            input_features (Optional[Tensor]): Input features with shape (batch_size, num_nodes, in_channels).
+            physical_coords (Optional[Tensor]): Coordinates with shape (batch_size, num_nodes, spatial_dim).
+            t_norm (Optional[Tensor]): Time indices with shape (batch_size,). Used only when use_time_input=True.
 
         Returns:
-            Per-node output predictions. Shape: (B, N, out_channels).
+            Tensor: Predictions with shape (batch_size, num_nodes, out_channels).
         """
-        # Concatenate features and coordinates, then project
-        fx = torch.cat([physical_coords, input_features], dim=-1)  # (B, N, in_channels + spatial_dim)
-        fx = self.preprocess(fx)  # (B, N, width)
+        self._validate_inputs(input_features, physical_coords)
 
-        # Add learnable placeholder bias
-        fx = fx + self.placeholder[None, None, :]  # broadcast (1, 1, width)
+        coord_features = self._get_coordinate_features(input_features, physical_coords)
 
-        # Pass through transformer blocks
+        if input_features is None:
+            hidden = self.preprocess(coord_features)
+        else:
+            hidden = self.preprocess(torch.cat([coord_features, input_features], dim=-1))
+
+        hidden = hidden + self.placeholder.view(1, 1, -1)
+
+        if self.time_fc is not None and t_norm is not None:
+            time_emb = timestep_embedding(t_norm, self.width)
+            time_emb = self.time_fc(time_emb).unsqueeze(1).expand(-1, hidden.shape[1], -1)
+            hidden = hidden + time_emb
+
         for block in self.blocks:
-            fx = block(fx)
+            hidden = block(hidden)
 
-        return fx  # (B, N, out_channels)
+        return hidden
 
     def predict(self, initial_state: Tensor, coords: Tensor, steps: int) -> Tensor:
-        """Autoregressive inference for time-dependent PDE rollout.
-
-        Iteratively applies the model for `steps` time steps, feeding each
-        prediction as the input to the next step. The normalized time t_norm
-        is passed for interface compatibility but is not used internally by
-        the original Transolver architecture.
-
-        Note: caller must call model.eval() before invoking this method.
+        """
+        Autoregressive rollout.
 
         Args:
-            initial_state: State at t=0. Shape: (B, N, in_channels).
-            coords: Node coordinates in [-1, 1]. Shape: (B, N, spatial_dim).
-            steps: Number of future steps to generate.
+            initial_state (Tensor): Initial state with shape (batch_size, num_nodes, in_channels).
+            coords (Tensor): Coordinates with shape (batch_size, num_nodes, spatial_dim).
+            steps (int): Number of rollout steps.
 
         Returns:
-            Predicted sequence including initial state.
-            Shape: (B, steps+1, N, out_channels).
+            Tensor: Sequence with shape (batch_size, steps + 1, num_nodes, out_channels).
         """
         device = next(self.parameters()).device
-        B = initial_state.shape[0]
+        batch_size = initial_state.shape[0]
         current_state = initial_state.to(device)
         coords = coords.to(device)
 
-        seq: List[Tensor] = [current_state.cpu()]
+        sequence: List[Tensor] = [current_state.cpu()]
 
         with torch.no_grad():
-            for t in tqdm(range(steps), desc='Predicting', leave=False, dynamic_ncols=True):
-                t_norm = torch.full((B,), t / max(steps, 1), device=device)
+            for step in tqdm(range(steps), desc='Predicting', leave=False, dynamic_ncols=True):
+                t_norm = torch.full((batch_size,), step / max(steps, 1), device=device)
                 next_state = self.forward(current_state, coords, t_norm=t_norm)
-                seq.append(next_state.cpu())
+                sequence.append(next_state.cpu())
                 current_state = next_state
 
-        return torch.stack(seq, dim=1)
+        return torch.stack(sequence, dim=1)

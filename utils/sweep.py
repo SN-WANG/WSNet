@@ -1,33 +1,42 @@
 """
-Sweep for wsnet, Combined functionality for:
-1. Cleaning Python cache files (__pycache__, *.pyc, *.pyo)
-2. Generating project directory tree with copy-to-clipboard support
+Project sweep utilities for WSNet.
 
-Author: Shengning Wang
+This module can clean Python cache artifacts and print a project tree.
 """
 
-import sys
-import pathlib
 import shutil
 import subprocess
-from typing import List, Union, Optional, Set
+import sys
 from pathlib import Path
+from typing import List, Optional, Set, Union
+
+PathLike = Union[str, Path]
+
+BYTECODE_PATTERNS = ("*.pyc", "*.pyo")
+DEFAULT_IGNORE_DIRS = {
+    ".git", "__pycache__", "node_modules", ".venv", "venv",
+    ".pytest_cache", ".mypy_cache", ".tox", ".idea", ".vscode",
+    "dist", "build", "*.egg-info",
+}
+DEFAULT_IGNORE_PATTERNS = {"*.pyc", "*.pyo", ".DS_Store", "*.log"}
 
 
-def setup_project_root(relative_depth: int = 2) -> pathlib.Path:
+# ============================================================
+# Project Root
+# ============================================================
+
+def setup_project_root(relative_depth: int = 2) -> Path:
     """
-    Configures the system path to include the project root directory.
-    
+    Add the inferred project root to sys.path and return it.
+
     Args:
-        relative_depth (int): The number of levels to traverse up from current 
-            file to find project root. 
-            Default is 2 (e.g., from wsnet/utils/project_utils.py to wsnet/).
+        relative_depth (int): Number of parent levels to step up from this file.
 
     Returns:
-        project_root (pathlib.Path): The absolute path to the project root.
+        Path: Resolved project root path.
     """
-    current_file: pathlib.Path = pathlib.Path(__file__).resolve()
-    project_root: pathlib.Path = current_file.parents[relative_depth - 1]
+    current_file = Path(__file__).resolve()
+    project_root = current_file.parents[relative_depth - 1]
 
     if str(project_root) not in sys.path:
         sys.path.insert(0, str(project_root))
@@ -35,54 +44,61 @@ def setup_project_root(relative_depth: int = 2) -> pathlib.Path:
     return project_root
 
 
-def clean_python_artifacts(
-    target_dir: Union[str, pathlib.Path] = ".",
-    verbose: bool = True
-) -> List[pathlib.Path]:
-    """
-    Recursively removes Python compilation artifacts and cache directories.
+# ============================================================
+# Cleanup
+# ============================================================
 
-    Targets:
-        1. *.pyc and *.pyo files (compiled bytecode).
-        2. __pycache__ directories.
+def _remove_matching_files(base_path: Path, patterns: List[str], verbose: bool) -> List[Path]:
+    removed_items: List[Path] = []
 
-    Args:
-        target_dir (Union[str, pathlib.Path]): The root directory to start cleaning.
-            Default is the current working directory.
-        verbose (bool): Whether to print cleanup progress. Default is True.
-
-    Returns:
-        removed_items (List[pathlib.Path]): List of all removed files and directories.
-    """
-    base_path: pathlib.Path = pathlib.Path(target_dir).resolve()
-    removed_items: List[pathlib.Path] = []
-
-    # 1. Remove compiled bytecode files
-    # Shape: N files matching the glob pattern
-    bytecode_patterns: List[str] = ["*.pyc", "*.pyo"]
-    for pattern in bytecode_patterns:
+    for pattern in patterns:
         for file_path in base_path.rglob(pattern):
             try:
                 file_path.unlink()
                 removed_items.append(file_path)
                 if verbose:
                     print(f"  🗑️  Removed file: {file_path.relative_to(base_path)}")
-            except (OSError, PermissionError) as e:
+            except (OSError, PermissionError) as error:
                 if verbose:
-                    print(f"  ⚠️  Failed to remove {file_path}: {e}")
+                    print(f"  ⚠️  Failed to remove {file_path}: {error}")
 
-    # 2. Remove cache directories
-    # Shape: M directories matching the name "__pycache__"
+    return removed_items
+
+
+def _remove_cache_dirs(base_path: Path, verbose: bool) -> List[Path]:
+    removed_items: List[Path] = []
+
     for cache_dir in base_path.rglob("__pycache__"):
-        if cache_dir.is_dir():
-            try:
-                shutil.rmtree(cache_dir)
-                removed_items.append(cache_dir)
-                if verbose:
-                    print(f"  🗑️  Removed dir:  {cache_dir.relative_to(base_path)}/")
-            except (OSError, PermissionError) as e:
-                if verbose:
-                    print(f"  ⚠️  Failed to remove {cache_dir}: {e}")
+        if not cache_dir.is_dir():
+            continue
+        try:
+            shutil.rmtree(cache_dir)
+            removed_items.append(cache_dir)
+            if verbose:
+                print(f"  🗑️  Removed dir:  {cache_dir.relative_to(base_path)}/")
+        except (OSError, PermissionError) as error:
+            if verbose:
+                print(f"  ⚠️  Failed to remove {cache_dir}: {error}")
+
+    return removed_items
+
+
+def clean_python_artifacts(target_dir: PathLike = ".", verbose: bool = True) -> List[Path]:
+    """
+    Remove Python bytecode files and cache directories under target_dir.
+
+    Args:
+        target_dir (PathLike): Root directory to clean.
+        verbose (bool): Whether to print cleanup progress.
+
+    Returns:
+        List[Path]: Removed files and directories.
+    """
+    base_path = Path(target_dir).resolve()
+    removed_items: List[Path] = []
+
+    removed_items.extend(_remove_matching_files(base_path, list(BYTECODE_PATTERNS), verbose))
+    removed_items.extend(_remove_cache_dirs(base_path, verbose))
 
     if verbose:
         print(f"\n✅ Cleanup complete: {len(removed_items)} items removed from {base_path.name}/")
@@ -90,30 +106,69 @@ def clean_python_artifacts(
     return removed_items
 
 
+# ============================================================
+# Tree Rendering
+# ============================================================
+
+def _normalize_ignore_dirs(ignore_dirs: Optional[Set[str]]) -> Set[str]:
+    return set(DEFAULT_IGNORE_DIRS) if ignore_dirs is None else ignore_dirs
+
+
+def _normalize_ignore_patterns(ignore_patterns: Optional[Set[str]]) -> Set[str]:
+    return set(DEFAULT_IGNORE_PATTERNS) if ignore_patterns is None else ignore_patterns
+
+
+def _matches_ignore_pattern(name: str, ignore_patterns: Set[str]) -> bool:
+    for pattern in ignore_patterns:
+        stripped_pattern = pattern.replace("*", "")
+        if name.endswith(stripped_pattern) or name == stripped_pattern:
+            return True
+    return False
+
+
+def _should_skip_item(item: Path, ignore_dirs: Set[str], ignore_patterns: Set[str]) -> bool:
+    name = item.name
+
+    if name.startswith(".") and name != ".env":
+        return True
+
+    if item.is_dir() and name in ignore_dirs:
+        return True
+
+    return _matches_ignore_pattern(name, ignore_patterns)
+
+
+def _list_tree_items(path: Path, ignore_dirs: Set[str], ignore_patterns: Set[str]) -> List[Path]:
+    items = list(path.iterdir())
+    filtered_items = [item for item in items if not _should_skip_item(item, ignore_dirs, ignore_patterns)]
+    filtered_items.sort(key=lambda item: (not item.is_dir(), item.name.lower()))
+    return filtered_items
+
+
 def generate_tree(
-    directory: Union[str, pathlib.Path],
+    directory: PathLike,
     prefix: str = "",
     ignore_dirs: Optional[Set[str]] = None,
     ignore_patterns: Optional[Set[str]] = None,
     max_depth: Optional[int] = None,
-    current_depth: int = 0
+    current_depth: int = 0,
 ) -> str:
     """
-    Generate a tree structure string of the directory.
+    Generate a formatted tree string for a directory.
 
     Args:
-        directory: Root directory to generate tree from
-        prefix: Prefix string for current line (used for recursion)
-        ignore_dirs: Set of directory names to ignore (default: common cache/env dirs)
-        ignore_patterns: Set of file patterns to ignore (e.g., "*.pyc")
-        max_depth: Maximum depth to traverse (None for unlimited)
-        current_depth: Current depth in recursion (internal use)
+        directory (PathLike): Root directory to render.
+        prefix (str): Prefix used by recursive calls.
+        ignore_dirs (Optional[Set[str]]): Directory names to skip.
+        ignore_patterns (Optional[Set[str]]): File patterns to skip.
+        max_depth (Optional[int]): Maximum traversal depth.
+        current_depth (int): Current recursion depth.
 
     Returns:
-        tree_string (str): Formatted tree structure
+        str: Directory tree content without the root line.
 
     Raises:
-        ValueError: If directory does not exist or is not accessible
+        ValueError: If directory does not exist or is not a directory.
     """
     path = Path(directory)
 
@@ -123,73 +178,33 @@ def generate_tree(
     if not path.is_dir():
         raise ValueError(f"Path is not a directory: {directory}")
 
-    # Default ignore patterns
-    if ignore_dirs is None:
-        ignore_dirs = {
-            ".git", "__pycache__", "node_modules", ".venv", "venv",
-            ".pytest_cache", ".mypy_cache", ".tox", ".idea", ".vscode",
-            "dist", "build", "*.egg-info"
-        }
-
-    if ignore_patterns is None:
-        ignore_patterns = {"*.pyc", "*.pyo", ".DS_Store", "*.log"}
-
-    # Check depth limit
     if max_depth is not None and current_depth > max_depth:
         return ""
 
+    ignore_dirs = _normalize_ignore_dirs(ignore_dirs)
+    ignore_patterns = _normalize_ignore_patterns(ignore_patterns)
     lines: List[str] = []
 
-    # Get directory contents
     try:
-        items = list(path.iterdir())
+        filtered_items = _list_tree_items(path, ignore_dirs, ignore_patterns)
     except PermissionError:
         return f"{prefix}[Permission Denied]\n"
 
-    # Filter items
-    filtered_items = []
-    for item in items:
-        name = item.name
-
-        # Skip hidden files (except .env files which are config)
-        if name.startswith(".") and name != ".env":
-            continue
-
-        # Skip ignored directories
-        if item.is_dir() and name in ignore_dirs:
-            continue
-
-        # Skip patterns
-        skip = False
-        for pattern in ignore_patterns:
-            if name.endswith(pattern.replace("*", "")) or name == pattern.replace("*", ""):
-                skip = True
-                break
-        if skip:
-            continue
-
-        filtered_items.append(item)
-
-    # Sort: directories first, then files, both alphabetically
-    filtered_items.sort(key=lambda x: (not x.is_dir(), x.name.lower()))
-
-    # Generate tree
-    for i, item in enumerate(filtered_items):
-        is_last = (i == len(filtered_items) - 1)
+    for item_index, item in enumerate(filtered_items):
+        is_last = item_index == len(filtered_items) - 1
         connector = "└── " if is_last else "├── "
         next_prefix = "    " if is_last else "│   "
 
         lines.append(f"{prefix}{connector}{item.name}")
 
         if item.is_dir():
-            # Recurse into subdirectory
             sub_tree = generate_tree(
                 item,
                 prefix + next_prefix,
                 ignore_dirs,
                 ignore_patterns,
                 max_depth,
-                current_depth + 1
+                current_depth + 1,
             )
             if sub_tree:
                 lines.append(sub_tree.rstrip())
@@ -198,68 +213,69 @@ def generate_tree(
 
 
 def print_tree(
-    directory: Optional[Union[str, pathlib.Path]] = None,
+    directory: Optional[PathLike] = None,
     root_name: Optional[str] = None,
-    max_depth: Optional[int] = None
+    max_depth: Optional[int] = None,
 ) -> str:
     """
-    Print and return the directory tree structure.
+    Print and return the directory tree.
 
     Args:
-        directory: Directory to print tree for (default: project root)
-        root_name: Custom name for root directory (default: actual folder name)
-        max_depth: Maximum depth to display
+        directory (Optional[PathLike]): Directory to render. Defaults to the project root.
+        root_name (Optional[str]): Root display name override.
+        max_depth (Optional[int]): Maximum traversal depth.
 
     Returns:
-        full_tree (str): Complete tree string including root
+        str: Tree string including the root line.
     """
     if directory is None:
         directory = setup_project_root(relative_depth=2)
 
     path = Path(directory).resolve()
     display_name = root_name or path.name
-
-    # Generate tree
     tree_content = generate_tree(path, max_depth=max_depth)
-
-    # Combine root and tree
     full_tree = f"📁 {display_name}/\n{tree_content}"
 
     print(full_tree)
     return full_tree
 
 
+# ============================================================
+# Clipboard And Entry Point
+# ============================================================
+
+def _resolve_clipboard_command() -> Optional[List[str]]:
+    if sys.platform == "darwin":
+        return ["pbcopy"]
+
+    if sys.platform == "win32":
+        return ["clip"]
+
+    if sys.platform.startswith("linux"):
+        if shutil.which("wl-copy"):
+            return ["wl-copy"]
+        if shutil.which("xclip"):
+            return ["xclip", "-selection", "clipboard"]
+
+        print("  ⚠️  Clipboard tool not found. Install 'wl-copy' or 'xclip'.")
+        return None
+
+    print(f"  ⚠️  Clipboard not supported on platform: {sys.platform}")
+    return None
+
+
 def copy_to_clipboard(text: str) -> bool:
     """
-    Copy text to system clipboard using native tools.
-
-    Supports:
-        - macOS (pbcopy)
-        - Linux (xclip or wl-copy)
-        - Windows (clip)
+    Copy text to the system clipboard using a native command.
 
     Args:
-        text (str): Text to copy to clipboard
+        text (str): Text to copy.
 
     Returns:
-        success (bool): True if successful, False otherwise
+        bool: Whether the copy command succeeded.
     """
-    # Detect platform and use appropriate command
-    if sys.platform == "darwin":  # macOS
-        cmd = ["pbcopy"]
-    elif sys.platform == "win32":  # Windows
-        cmd = ["clip"]
-    elif sys.platform.startswith("linux"):  # Linux
-        # Try wl-copy (Wayland) first, then xclip (X11)
-        if shutil.which("wl-copy"):
-            cmd = ["wl-copy"]
-        elif shutil.which("xclip"):
-            cmd = ["xclip", "-selection", "clipboard"]
-        else:
-            print("  ⚠️  Clipboard tool not found. Install 'wl-copy' or 'xclip'.")
-            return False
-    else:
-        print(f"  ⚠️  Clipboard not supported on platform: {sys.platform}")
+    cmd = _resolve_clipboard_command()
+    if cmd is None:
         return False
 
     try:
@@ -267,18 +283,18 @@ def copy_to_clipboard(text: str) -> bool:
             cmd,
             stdin=subprocess.PIPE,
             close_fds=True,
-            universal_newlines=True
+            universal_newlines=True,
         )
         process.communicate(input=text)
 
         if process.returncode == 0:
             return True
-        else:
-            print(f"  ⚠️  Clipboard command failed with code: {process.returncode}")
-            return False
 
-    except Exception as e:
-        print(f"  ⚠️  Failed to copy to clipboard: {e}")
+        print(f"  ⚠️  Clipboard command failed with code: {process.returncode}")
+        return False
+
+    except Exception as error:
+        print(f"  ⚠️  Failed to copy to clipboard: {error}")
         return False
 
 
@@ -287,60 +303,38 @@ def main(
     auto_clean: bool = True,
     print_structure: bool = True,
     copy_clipboard: bool = True,
-    max_tree_depth: Optional[int] = None
+    max_tree_depth: Optional[int] = None,
 ) -> None:
     """
-    Main entry point for sweep.
-
-    Performs the following operations in order:
-    1. Sets up project root in sys.path
-    2. Cleans Python cache artifacts (if auto_clean=True)
-    3. Generates and prints directory tree (if print_structure=True)
-    4. Copies tree to clipboard (if copy_clipboard=True)
+    Run the sweep workflow.
 
     Args:
-        relative_depth (int): Levels to traverse up to find project root (default: 2)
-        auto_clean (bool): Whether to clean cache files automatically (default: True)
-        print_structure (bool): Whether to print tree structure (default: True)
-        copy_clipboard (bool): Whether to copy tree to clipboard (default: True)
-        max_tree_depth (Optional[int]): Maximum depth for tree display (default: None)
-
-    Example:
-        # From wsnet/utils/project_utils.py, clean and print tree
-        >>> main(relative_depth=2)
-
-        # From deeper location, adjust depth
-        >>> main(relative_depth=3)
-
-        # Only clean, don"t print tree
-        >>> main(auto_clean=True, print_structure=False)
+        relative_depth (int): Parent depth used to infer the project root.
+        auto_clean (bool): Whether to remove Python artifacts.
+        print_structure (bool): Whether to print the project tree.
+        copy_clipboard (bool): Whether to copy the tree to the clipboard.
+        max_tree_depth (Optional[int]): Maximum depth for the tree view.
     """
     print("=" * 60)
     print("WSNET Project Utilities")
     print("=" * 60)
 
-    # Step 1: Setup project root
     print(f"\n📍 Setting up project root (depth={relative_depth})...")
     project_root = setup_project_root(relative_depth=relative_depth)
     print(f"   Project root: {project_root}")
 
-    # Step 2: Clean cache files
     if auto_clean:
-        print(f"\n🧹 Cleaning Python artifacts...")
+        print("\n🧹 Cleaning Python artifacts...")
         removed = clean_python_artifacts(target_dir=project_root, verbose=True)
         print(f"   Total removed: {len(removed)} items")
 
-    # Step 3 & 4: Generate tree and copy to clipboard
     tree_string = ""
     if print_structure:
-        print(f"\n📂 Generating project structure...")
-        tree_string = print_tree(
-            directory=project_root,
-            max_depth=max_tree_depth
-        )
+        print("\n📂 Generating project structure...")
+        tree_string = print_tree(directory=project_root, max_depth=max_tree_depth)
 
         if copy_clipboard:
-            print(f"\n📋 Copying to clipboard...")
+            print("\n📋 Copying to clipboard...")
             if copy_to_clipboard(tree_string):
                 print("   ✅ Successfully copied to clipboard!")
             else:
@@ -353,17 +347,10 @@ def main(
 
 
 if __name__ == "__main__":
-    """
-    Default execution: Run from <project_name>/wsnet/utils/sweep.py
-
-    Adjust relative_depth based on file location:
-    - From <project_name>/wsnet/utils/sweep.py: relative_depth=3
-    - From <project_name>/wsnet/utils/tools/sweep.py: relative_depth=4
-    """
     main(
-        relative_depth=2,           # Adjust based on file location
-        auto_clean=True,            # Clean __pycache__ and *.pyc
-        print_structure=True,       # Print directory tree
-        copy_clipboard=True,        # Copy tree to clipboard
-        max_tree_depth=None         # No depth limit (or set to 3, 4, etc.)
+        relative_depth=2,
+        auto_clean=True,
+        print_structure=True,
+        copy_clipboard=True,
+        max_tree_depth=None,
     )
