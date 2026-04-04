@@ -1,195 +1,39 @@
 # CFSSDA Dragonfly Optimizer
-# Code author: Shengning Wang
+# Author: Shengning Wang
 
-import numpy as np
-from scipy.optimize import Bounds, LinearConstraint, NonlinearConstraint, OptimizeResult, minimize
-from scipy.special import gamma
 from typing import Any, Callable, List, Optional, Sequence, Tuple, Union
 
+import numpy as np
+from scipy.optimize import Bounds, OptimizeResult, minimize
+from scipy.special import gamma
 
-def _parse_bounds(bounds: Union[Bounds, Sequence[Tuple[float, float]]]) -> Tuple[np.ndarray, np.ndarray]:
-    """
-    Convert box bounds to lower and upper vectors.
-    """
-    if isinstance(bounds, Bounds):
-        lower = np.asarray(bounds.lb, dtype=np.float64).reshape(-1)
-        upper = np.asarray(bounds.ub, dtype=np.float64).reshape(-1)
-    else:
-        bounds_arr = np.asarray(bounds, dtype=np.float64)
-        if bounds_arr.ndim != 2 or bounds_arr.shape[1] != 2:
-            raise ValueError("Bounds must have shape (num_vars, 2).")
-        lower = bounds_arr[:, 0]
-        upper = bounds_arr[:, 1]
-
-    if lower.shape != upper.shape:
-        raise ValueError("Lower and upper bounds must have the same shape.")
-    if np.any(~np.isfinite(lower)) or np.any(~np.isfinite(upper)):
-        raise ValueError("Bounds must be finite.")
-    if np.any(upper <= lower):
-        raise ValueError("Each upper bound must be greater than the lower bound.")
-
-    return lower, upper
-
-
-def _normalize_constraints(constraints: Union[Sequence[Any], Any]) -> Tuple[Any, ...]:
-    """
-    Normalize constraints to a tuple.
-    """
-    if constraints is None:
-        return ()
-    if isinstance(constraints, (list, tuple)):
-        return tuple(constraints)
-    return (constraints,)
-
-
-def _repair_to_bounds(x: np.ndarray, lower: np.ndarray, upper: np.ndarray) -> np.ndarray:
-    """
-    Reflect points back into the search box.
-    """
-    x = np.where(x < lower, 2.0 * lower - x, x)
-    x = np.where(x > upper, 2.0 * upper - x, x)
-    return np.clip(x, lower, upper)
-
-
-def _constraint_violation(x: np.ndarray, constraints: Sequence[Any], args: Tuple[Any, ...]) -> float:
-    """
-    Calculate the total constraint violation at one point.
-    """
-    if not constraints:
-        return 0.0
-
-    violation = 0.0
-    for con in constraints:
-        if isinstance(con, LinearConstraint):
-            values = np.atleast_1d(con.A @ x)
-            lower = np.atleast_1d(con.lb).astype(np.float64)
-            upper = np.atleast_1d(con.ub).astype(np.float64)
-            low_violation = np.maximum(lower - values, 0.0)
-            up_violation = np.maximum(values - upper, 0.0)
-            low_violation[~np.isfinite(lower)] = 0.0
-            up_violation[~np.isfinite(upper)] = 0.0
-            violation += float(np.sum(low_violation + up_violation))
-            continue
-
-        if isinstance(con, NonlinearConstraint):
-            values = np.atleast_1d(con.fun(x))
-            lower = np.atleast_1d(con.lb).astype(np.float64)
-            upper = np.atleast_1d(con.ub).astype(np.float64)
-            low_violation = np.maximum(lower - values, 0.0)
-            up_violation = np.maximum(values - upper, 0.0)
-            low_violation[~np.isfinite(lower)] = 0.0
-            up_violation[~np.isfinite(upper)] = 0.0
-            violation += float(np.sum(low_violation + up_violation))
-            continue
-
-        if isinstance(con, dict):
-            con_type = con.get("type", "").lower()
-            con_fun = con.get("fun")
-            con_args = con.get("args", args)
-            if con_fun is None:
-                raise ValueError("Constraint dict must contain key 'fun'.")
-
-            values = np.atleast_1d(con_fun(x, *con_args))
-            if con_type == "ineq":
-                violation += float(np.sum(np.maximum(-values, 0.0)))
-            elif con_type == "eq":
-                violation += float(np.sum(np.abs(values)))
-            else:
-                raise ValueError(f"Unsupported constraint type: {con_type}.")
-            continue
-
-        raise TypeError("Unsupported constraint format.")
-
-    return violation
-
-
-def _normalize_weights(num_objectives: int, objective_weights: Optional[np.ndarray]) -> np.ndarray:
-    """
-    Normalize multi-objective weights.
-    """
-    if objective_weights is None:
-        return np.ones(num_objectives, dtype=np.float64) / num_objectives
-
-    weights = np.asarray(objective_weights, dtype=np.float64).reshape(-1)
-    if weights.size != num_objectives:
-        raise ValueError("Objective weights must match the objective dimension.")
-    if np.any(weights < 0.0):
-        raise ValueError("Objective weights must be non-negative.")
-
-    weight_sum = np.sum(weights)
-    if weight_sum <= 0.0:
-        raise ValueError("Objective weights must have a positive sum.")
-
-    return weights / weight_sum
-
-
-def _nondominated_indices(y: np.ndarray) -> np.ndarray:
-    """
-    Return indices of the Pareto non-dominated points.
-    """
-    num_points = y.shape[0]
-    dominated = np.zeros(num_points, dtype=bool)
-
-    for i in range(num_points):
-        if dominated[i]:
-            continue
-        better_or_equal = np.all(y <= y[i], axis=1)
-        strictly_better = np.any(y < y[i], axis=1)
-        dominates_i = better_or_equal & strictly_better
-        dominates_i[i] = False
-        if np.any(dominates_i):
-            dominated[i] = True
-
-    return np.where(~dominated)[0]
-
-
-def _evaluate_population(
-    population: np.ndarray,
-    func: Callable,
-    args: Tuple[Any, ...],
-    multi_objective: bool,
-    weights: Optional[np.ndarray],
-    scalarization: str,
-    reference_values: Optional[np.ndarray] = None,
-) -> Tuple[np.ndarray, np.ndarray]:
-    """
-    Evaluate the full population and return objective vectors and scalar fitness.
-    """
-    objective_vectors = []
-    for i in range(population.shape[0]):
-        values = np.atleast_1d(np.asarray(func(population[i], *args), dtype=np.float64)).reshape(-1)
-        objective_vectors.append(values)
-
-    objective_vectors = np.vstack(objective_vectors)
-
-    if not multi_objective:
-        if objective_vectors.shape[1] != 1:
-            raise ValueError("Objective returned multiple values; set multi_objective=True.")
-        return objective_vectors, objective_vectors[:, 0]
-
-    if objective_vectors.shape[1] < 2:
-        raise ValueError("Multi-objective mode requires at least two objectives.")
-
-    if weights is None:
-        weights = np.ones(objective_vectors.shape[1], dtype=np.float64) / objective_vectors.shape[1]
-
-    if scalarization == "weighted_sum":
-        objective_scalars = objective_vectors @ weights
-    elif scalarization == "tchebycheff":
-        if reference_values is None or reference_values.size == 0:
-            ideal = np.min(objective_vectors, axis=0)
-        else:
-            ideal = np.min(reference_values, axis=0)
-        objective_scalars = np.max(weights[None, :] * np.abs(objective_vectors - ideal), axis=1)
-    else:
-        raise ValueError("Unsupported scalarization method.")
-
-    return objective_vectors, objective_scalars
+from models.optimization._shared import (
+    _append_archive,
+    _apply_initial_guess,
+    _constraint_violation,
+    _evaluate_constraint_violations,
+    _evaluate_population,
+    _finalize_pareto_archive,
+    _initialize_objective_values,
+    _make_rng,
+    _normalize_constraints,
+    _normalize_weights,
+    _parse_bounds,
+    _repair_to_bounds,
+)
 
 
 def _levy_flight(num_vars: int, beta: float, rng: np.random.Generator) -> np.ndarray:
     """
     Generate one Levy-flight step.
+
+    Args:
+        num_vars (int): Number of variables.
+        beta (float): Levy-flight exponent.
+        rng (np.random.Generator): Random number generator.
+
+    Returns:
+        np.ndarray: Levy-flight step with shape (num_vars,) and dtype float64.
     """
     if not (0.0 < beta <= 2.0):
         raise ValueError("levy_beta must be in (0, 2].")
@@ -202,6 +46,138 @@ def _levy_flight(num_vars: int, beta: float, rng: np.random.Generator) -> np.nda
     u = rng.normal(0.0, sigma_u, size=num_vars)
     v = rng.normal(0.0, 1.0, size=num_vars)
     return 0.01 * u / (np.abs(v) ** (1.0 / beta) + 1e-12)
+
+
+def _compute_coulomb_force(
+    population: np.ndarray,
+    index: int,
+    kbest: np.ndarray,
+    masses: np.ndarray,
+    enemy_pos: np.ndarray,
+    enemy_mass: float,
+    k_t: float,
+    rng: np.random.Generator,
+) -> np.ndarray:
+    """
+    Compute the Coulomb interaction force for one individual.
+
+    Args:
+        population (np.ndarray): Population with shape (num_points, num_vars) and dtype float64.
+        index (int): Current individual index.
+        kbest (np.ndarray): Indices of the current k-best set with shape (num_kbest,) and dtype int64.
+        masses (np.ndarray): Mass values with shape (num_points,) and dtype float64.
+        enemy_pos (np.ndarray): Worst individual position with shape (num_vars,) and dtype float64.
+        enemy_mass (float): Mass of the worst individual.
+        k_t (float): Iteration-dependent Coulomb coefficient.
+        rng (np.random.Generator): Random number generator.
+
+    Returns:
+        np.ndarray: Interaction force with shape (num_vars,) and dtype float64.
+    """
+    force = np.zeros(population.shape[1], dtype=np.float64)
+
+    for other_index in kbest:
+        if other_index == index:
+            continue
+        diff = population[other_index] - population[index]
+        dist = np.linalg.norm(diff) + 1e-12
+        force += rng.random() * k_t * masses[index] * masses[other_index] * diff / dist
+
+    enemy_diff = enemy_pos - population[index]
+    enemy_dist = np.linalg.norm(enemy_diff) + 1e-12
+    force -= rng.random() * k_t * masses[index] * enemy_mass * enemy_diff / enemy_dist
+    return force
+
+
+def _update_population(
+    population: np.ndarray,
+    delta_x: np.ndarray,
+    masses: np.ndarray,
+    fit_g: np.ndarray,
+    kbest: np.ndarray,
+    food_pos: np.ndarray,
+    enemy_pos: np.ndarray,
+    enemy_mass: float,
+    neighbor_radius: float,
+    inertia: float,
+    behavior: float,
+    k_t: float,
+    levy_beta: float,
+    span: np.ndarray,
+    rng: np.random.Generator,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Generate one dragonfly population update.
+
+    Args:
+        population (np.ndarray): Population with shape (num_points, num_vars) and dtype float64.
+        delta_x (np.ndarray): Velocity-like state with shape (num_points, num_vars) and dtype float64.
+        masses (np.ndarray): Mass values with shape (num_points,) and dtype float64.
+        fit_g (np.ndarray): Scaled mass values with shape (num_points,) and dtype float64.
+        kbest (np.ndarray): Indices of the current k-best set with shape (num_kbest,) and dtype int64.
+        food_pos (np.ndarray): Best position with shape (num_vars,) and dtype float64.
+        enemy_pos (np.ndarray): Worst position with shape (num_vars,) and dtype float64.
+        enemy_mass (float): Mass of the worst individual.
+        neighbor_radius (float): Neighborhood radius.
+        inertia (float): Inertia coefficient.
+        behavior (float): Social behavior coefficient.
+        k_t (float): Iteration-dependent Coulomb coefficient.
+        levy_beta (float): Levy-flight exponent.
+        span (np.ndarray): Variable ranges with shape (num_vars,) and dtype float64.
+        rng (np.random.Generator): Random number generator.
+
+    Returns:
+        Tuple[np.ndarray, np.ndarray]:
+            Updated population and updated velocity-like state, both with shape
+            (num_points, num_vars) and dtype float64.
+    """
+    num_points, num_vars = population.shape
+    max_step = 0.2 * span
+    new_population = population.copy()
+    new_delta_x = delta_x.copy()
+
+    for i in range(num_points):
+        distances = np.linalg.norm(population - population[i], axis=1)
+        neighbors = np.where((distances > 0.0) & (distances <= neighbor_radius))[0]
+
+        if neighbors.size == 0:
+            levy_step = _levy_flight(num_vars, levy_beta, rng) * np.maximum(np.abs(population[i]), 1.0)
+            new_delta_x[i] = levy_step
+            new_population[i] = population[i] + levy_step
+            continue
+
+        separation = -np.sum(population[i] - population[neighbors], axis=0)
+        alignment = np.mean(delta_x[neighbors], axis=0)
+        cohesion = np.mean(population[neighbors], axis=0) - population[i]
+        food_attraction = food_pos - population[i]
+        enemy_avoidance = population[i] - enemy_pos
+
+        force = _compute_coulomb_force(
+            population=population,
+            index=i,
+            kbest=kbest,
+            masses=masses,
+            enemy_pos=enemy_pos,
+            enemy_mass=enemy_mass,
+            k_t=k_t,
+            rng=rng,
+        )
+        acceleration = force / (fit_g[i] + 1e-12)
+
+        step = (
+            inertia * delta_x[i]
+            + behavior * rng.random() * separation
+            + behavior * rng.random() * alignment
+            + behavior * rng.random() * cohesion
+            + 2.0 * rng.random() * food_attraction
+            + behavior * rng.random() * enemy_avoidance
+            + acceleration
+        )
+        step = np.clip(step, -max_step, max_step)
+        new_delta_x[i] = step
+        new_population[i] = population[i] + step
+
+    return new_population, new_delta_x
 
 
 def dragonfly_optimize(
@@ -233,21 +209,22 @@ def dragonfly_optimize(
     levy_beta: float = 1.5,
 ) -> OptimizeResult:
     """
-    Coulomb-force-search dragonfly optimizer.
+    Optimize a continuous objective with the Coulomb-force-search dragonfly algorithm.
 
     Args:
-        func (Callable): Objective function.
-        bounds (Union[Bounds, Sequence[Tuple[float, float]]]): Variable bounds.
+        func (Callable): Objective function that maps a candidate with shape (num_vars,) and dtype float64
+            to either a scalar or an objective vector with shape (num_objectives,) and dtype float64.
+        bounds (Union[Bounds, Sequence[Tuple[float, float]]]): Variable bounds for each dimension.
         args (Tuple[Any, ...]): Extra objective arguments.
         maxiter (int): Maximum iterations.
         popsize (int): Population size multiplier.
         tol (float): Convergence tolerance.
-        seed (Optional[Union[int, np.random.Generator]]): Random seed.
+        seed (Optional[Union[int, np.random.Generator]]): Random seed or generator.
         polish (bool): Whether to run local refinement at the end.
-        constraints (Union[Sequence[Any], Any]): Constraints.
-        x0 (Optional[np.ndarray]): Initial guess.
+        constraints (Union[Sequence[Any], Any]): Constraints accepted by SciPy.
+        x0 (Optional[np.ndarray]): Initial guess with shape (num_vars,) and dtype float64.
         multi_objective (bool): Whether the objective is multi-objective.
-        objective_weights (Optional[np.ndarray]): Objective weights.
+        objective_weights (Optional[np.ndarray]): Objective weights with shape (num_objectives,) and dtype float64.
         scalarization (str): Scalarization method.
         return_pareto (bool): Whether to return Pareto points.
         penalty_start (float): Initial penalty factor.
@@ -259,12 +236,12 @@ def dragonfly_optimize(
         neighbor_radius_start (Optional[float]): Initial neighborhood radius.
         neighbor_radius_end (float): Final neighborhood radius.
         coulomb_alpha_mean (float): Mean decay factor for Coulomb search.
-        coulomb_alpha_std (float): Std decay factor for Coulomb search.
+        coulomb_alpha_std (float): Standard deviation of the decay factor.
         k0 (float): Initial Coulomb coefficient.
-        levy_beta (float): Levy-flight beta.
+        levy_beta (float): Levy-flight exponent.
 
     Returns:
-        OptimizeResult: Optimization result.
+        OptimizeResult: SciPy-style optimization result with population state and optional Pareto front.
     """
     lower, upper = _parse_bounds(bounds)
     num_vars = lower.size
@@ -283,10 +260,7 @@ def dragonfly_optimize(
     if scalarization not in ["weighted_sum", "tchebycheff"]:
         raise ValueError("Unsupported scalarization method.")
 
-    if isinstance(seed, np.random.Generator):
-        rng = seed
-    else:
-        rng = np.random.default_rng(seed)
+    rng = _make_rng(seed)
 
     if neighbor_radius_start is None:
         neighbor_radius_start = 0.25 * float(np.linalg.norm(span))
@@ -294,37 +268,20 @@ def dragonfly_optimize(
     neighbor_radius_end = max(neighbor_radius_end, 0.0)
 
     population = rng.uniform(lower, upper, size=(num_pop, num_vars))
-    if x0 is not None:
-        x0 = np.asarray(x0, dtype=np.float64).reshape(-1)
-        if x0.size != num_vars:
-            raise ValueError("x0 dimension does not match bounds.")
-        population[0] = np.clip(x0, lower, upper)
-
+    _apply_initial_guess(population, x0, lower, upper)
     delta_x = rng.uniform(-0.1, 0.1, size=(num_pop, num_vars)) * span
 
-    weights = None
-    objective_vectors, objective_scalars = _evaluate_population(
+    objective_vectors, objective_scalars, weights = _initialize_objective_values(
         population=population,
         func=func,
         args=args,
         multi_objective=multi_objective,
-        weights=weights,
+        objective_weights=objective_weights,
         scalarization=scalarization,
     )
     nfev = num_pop
 
-    if multi_objective:
-        weights = _normalize_weights(objective_vectors.shape[1], objective_weights)
-        if scalarization == "weighted_sum":
-            objective_scalars = objective_vectors @ weights
-        else:
-            ideal = np.min(objective_vectors, axis=0)
-            objective_scalars = np.max(weights[None, :] * np.abs(objective_vectors - ideal), axis=1)
-
-    violations = np.array(
-        [_constraint_violation(population[i], constraints, args) for i in range(num_pop)],
-        dtype=np.float64,
-    )
+    violations = _evaluate_constraint_violations(population, constraints, args)
     penalty_factor = float(penalty_start)
     energies = objective_scalars + penalty_factor * violations
 
@@ -332,9 +289,7 @@ def dragonfly_optimize(
     archive_f: List[np.ndarray] = []
     archive_v: List[float] = []
     if return_pareto and multi_objective:
-        archive_x.extend([row.copy() for row in population])
-        archive_f.extend([row.copy() for row in objective_vectors])
-        archive_v.extend([float(value) for value in violations])
+        _append_archive(archive_x, archive_f, archive_v, population, objective_vectors, violations)
 
     best_idx = int(np.argmin(energies))
     best_x = population[best_idx].copy()
@@ -367,55 +322,28 @@ def dragonfly_optimize(
         enemy_idx = int(np.argmax(energies))
         food_pos = population[food_idx]
         enemy_pos = population[enemy_idx]
+        enemy_mass = float(mass[enemy_idx])
 
         alpha_hat = abs(rng.normal(coulomb_alpha_mean, coulomb_alpha_std))
         k_t = k0 * np.exp(-alpha_hat * (iteration + 1) / maxiter)
-        max_step = 0.2 * span
 
-        new_population = population.copy()
-        new_delta_x = delta_x.copy()
-
-        for i in range(num_pop):
-            distances = np.linalg.norm(population - population[i], axis=1)
-            neighbors = np.where((distances > 0.0) & (distances <= neighbor_radius))[0]
-
-            if neighbors.size == 0:
-                levy_step = _levy_flight(num_vars, levy_beta, rng) * np.maximum(np.abs(population[i]), 1.0)
-                new_delta_x[i] = levy_step
-                new_population[i] = population[i] + levy_step
-                continue
-
-            separation = -np.sum(population[i] - population[neighbors], axis=0)
-            alignment = np.mean(delta_x[neighbors], axis=0)
-            cohesion = np.mean(population[neighbors], axis=0) - population[i]
-            food_attraction = food_pos - population[i]
-            enemy_avoidance = population[i] - enemy_pos
-
-            force = np.zeros(num_vars, dtype=np.float64)
-            for j in kbest:
-                if j == i:
-                    continue
-                diff = population[j] - population[i]
-                dist = np.linalg.norm(diff) + 1e-12
-                force += rng.random() * k_t * mass[i] * mass[j] * diff / dist
-
-            enemy_diff = enemy_pos - population[i]
-            enemy_dist = np.linalg.norm(enemy_diff) + 1e-12
-            force -= rng.random() * k_t * mass[i] * mass[enemy_idx] * enemy_diff / enemy_dist
-            acceleration = force / (fit_g[i] + 1e-12)
-
-            step = (
-                inertia * delta_x[i]
-                + behavior * rng.random() * separation
-                + behavior * rng.random() * alignment
-                + behavior * rng.random() * cohesion
-                + 2.0 * rng.random() * food_attraction
-                + behavior * rng.random() * enemy_avoidance
-                + acceleration
-            )
-            step = np.clip(step, -max_step, max_step)
-            new_delta_x[i] = step
-            new_population[i] = population[i] + step
+        new_population, new_delta_x = _update_population(
+            population=population,
+            delta_x=delta_x,
+            masses=mass,
+            fit_g=fit_g,
+            kbest=kbest,
+            food_pos=food_pos,
+            enemy_pos=enemy_pos,
+            enemy_mass=enemy_mass,
+            neighbor_radius=neighbor_radius,
+            inertia=inertia,
+            behavior=behavior,
+            k_t=k_t,
+            levy_beta=levy_beta,
+            span=span,
+            rng=rng,
+        )
 
         new_population = _repair_to_bounds(new_population, lower, upper)
         reference_values = objective_vectors if multi_objective else None
@@ -430,10 +358,7 @@ def dragonfly_optimize(
         )
         nfev += num_pop
 
-        new_violations = np.array(
-            [_constraint_violation(new_population[i], constraints, args) for i in range(num_pop)],
-            dtype=np.float64,
-        )
+        new_violations = _evaluate_constraint_violations(new_population, constraints, args)
         penalty_factor *= penalty_growth
         new_energies = new_objective_scalars + penalty_factor * new_violations
 
@@ -446,9 +371,7 @@ def dragonfly_optimize(
         energies[improved] = new_energies[improved]
 
         if return_pareto and multi_objective:
-            archive_x.extend([row.copy() for row in population])
-            archive_f.extend([row.copy() for row in objective_vectors])
-            archive_v.extend([float(value) for value in violations])
+            _append_archive(archive_x, archive_f, archive_v, population, objective_vectors, violations)
 
         curr_best_idx = int(np.argmin(energies))
         if energies[curr_best_idx] < best_energy:
@@ -516,23 +439,9 @@ def dragonfly_optimize(
 
     if multi_objective:
         result.fun_vector = best_f.copy()
-        if return_pareto and len(archive_f) > 0:
-            archive_y = np.asarray(archive_f, dtype=np.float64)
-            archive_x = np.asarray(archive_x, dtype=np.float64)
-            archive_v = np.asarray(archive_v, dtype=np.float64)
-
-            feasible_mask = archive_v <= 1e-8
-            if np.any(feasible_mask):
-                archive_y = archive_y[feasible_mask]
-                archive_x = archive_x[feasible_mask]
-            else:
-                best_violation = np.min(archive_v)
-                near_mask = archive_v <= best_violation + 1e-8
-                archive_y = archive_y[near_mask]
-                archive_x = archive_x[near_mask]
-
-            nd_idx = _nondominated_indices(archive_y)
-            result.pareto_f = archive_y[nd_idx]
-            result.pareto_x = archive_x[nd_idx]
+        if return_pareto and archive_f:
+            pareto_x, pareto_f = _finalize_pareto_archive(archive_x, archive_f, archive_v)
+            result.pareto_f = pareto_f
+            result.pareto_x = pareto_x
 
     return result

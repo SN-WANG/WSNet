@@ -1,8 +1,5 @@
-"""
-Project sweep utilities for WSNet.
-
-This module can clean Python cache artifacts and print a project tree.
-"""
+# Project sweeper cleaning Python cache artifacts and printing a project tree.
+# Author: Shengning Wang
 
 import shutil
 import subprocess
@@ -19,6 +16,8 @@ DEFAULT_IGNORE_DIRS = {
     "dist", "build", "*.egg-info",
 }
 DEFAULT_IGNORE_PATTERNS = {"*.pyc", "*.pyo", ".DS_Store", "*.log"}
+APP_TITLE = "WSNET Project Utilities"
+BANNER_WIDTH = 60
 
 
 # ============================================================
@@ -145,6 +144,46 @@ def _list_tree_items(path: Path, ignore_dirs: Set[str], ignore_patterns: Set[str
     return filtered_items
 
 
+def _build_tree_lines(
+    path: Path,
+    prefix: str,
+    ignore_dirs: Set[str],
+    ignore_patterns: Set[str],
+    max_depth: Optional[int],
+    current_depth: int,
+) -> List[str]:
+    lines: List[str] = []
+
+    if max_depth is not None and current_depth > max_depth:
+        return lines
+
+    try:
+        tree_items = _list_tree_items(path, ignore_dirs, ignore_patterns)
+    except PermissionError:
+        return [f"{prefix}[Permission Denied]"]
+
+    for item_index, item in enumerate(tree_items):
+        is_last = item_index == len(tree_items) - 1
+        connector = "└── " if is_last else "├── "
+        child_prefix = prefix + ("    " if is_last else "│   ")
+
+        lines.append(f"{prefix}{connector}{item.name}")
+
+        if item.is_dir():
+            lines.extend(
+                _build_tree_lines(
+                    item,
+                    child_prefix,
+                    ignore_dirs,
+                    ignore_patterns,
+                    max_depth,
+                    current_depth + 1,
+                )
+            )
+
+    return lines
+
+
 def generate_tree(
     directory: PathLike,
     prefix: str = "",
@@ -178,37 +217,9 @@ def generate_tree(
     if not path.is_dir():
         raise ValueError(f"Path is not a directory: {directory}")
 
-    if max_depth is not None and current_depth > max_depth:
-        return ""
-
     ignore_dirs = _normalize_ignore_dirs(ignore_dirs)
     ignore_patterns = _normalize_ignore_patterns(ignore_patterns)
-    lines: List[str] = []
-
-    try:
-        filtered_items = _list_tree_items(path, ignore_dirs, ignore_patterns)
-    except PermissionError:
-        return f"{prefix}[Permission Denied]\n"
-
-    for item_index, item in enumerate(filtered_items):
-        is_last = item_index == len(filtered_items) - 1
-        connector = "└── " if is_last else "├── "
-        next_prefix = "    " if is_last else "│   "
-
-        lines.append(f"{prefix}{connector}{item.name}")
-
-        if item.is_dir():
-            sub_tree = generate_tree(
-                item,
-                prefix + next_prefix,
-                ignore_dirs,
-                ignore_patterns,
-                max_depth,
-                current_depth + 1,
-            )
-            if sub_tree:
-                lines.append(sub_tree.rstrip())
-
+    lines = _build_tree_lines(path, prefix, ignore_dirs, ignore_patterns, max_depth, current_depth)
     return "\n".join(lines)
 
 
@@ -264,6 +275,26 @@ def _resolve_clipboard_command() -> Optional[List[str]]:
     return None
 
 
+def _run_clipboard_command(command: List[str], text: str) -> bool:
+    try:
+        process = subprocess.Popen(
+            command,
+            stdin=subprocess.PIPE,
+            close_fds=True,
+            universal_newlines=True,
+        )
+        process.communicate(input=text)
+    except Exception as error:
+        print(f"  ⚠️  Failed to copy to clipboard: {error}")
+        return False
+
+    if process.returncode == 0:
+        return True
+
+    print(f"  ⚠️  Clipboard command failed with code: {process.returncode}")
+    return False
+
+
 def copy_to_clipboard(text: str) -> bool:
     """
     Copy text to the system clipboard using a native command.
@@ -274,28 +305,56 @@ def copy_to_clipboard(text: str) -> bool:
     Returns:
         bool: Whether the copy command succeeded.
     """
-    cmd = _resolve_clipboard_command()
-    if cmd is None:
+    command = _resolve_clipboard_command()
+    if command is None:
         return False
 
-    try:
-        process = subprocess.Popen(
-            cmd,
-            stdin=subprocess.PIPE,
-            close_fds=True,
-            universal_newlines=True,
-        )
-        process.communicate(input=text)
+    return _run_clipboard_command(command, text)
 
-        if process.returncode == 0:
-            return True
 
-        print(f"  ⚠️  Clipboard command failed with code: {process.returncode}")
-        return False
+def _print_banner() -> None:
+    line = "=" * BANNER_WIDTH
+    print(line)
+    print(APP_TITLE)
+    print(line)
 
-    except Exception as error:
-        print(f"  ⚠️  Failed to copy to clipboard: {error}")
-        return False
+
+def _setup_project_root_step(relative_depth: int) -> Path:
+    print(f"\n📍 Setting up project root (depth={relative_depth})...")
+    project_root = setup_project_root(relative_depth=relative_depth)
+    print(f"   Project root: {project_root}")
+    return project_root
+
+
+def _cleanup_step(project_root: Path) -> List[Path]:
+    print("\n🧹 Cleaning Python artifacts...")
+    removed_items = clean_python_artifacts(target_dir=project_root, verbose=True)
+    print(f"   Total removed: {len(removed_items)} items")
+    return removed_items
+
+
+def _tree_step(project_root: Path, max_tree_depth: Optional[int], copy_clipboard: bool) -> str:
+    print("\n📂 Generating project structure...")
+    tree_string = print_tree(directory=project_root, max_depth=max_tree_depth)
+
+    if not copy_clipboard:
+        return tree_string
+
+    print("\n📋 Copying to clipboard...")
+    if copy_to_clipboard(tree_string):
+        print("   ✅ Successfully copied to clipboard!")
+        return tree_string
+
+    print("   ❌ Failed to copy to clipboard")
+    print("   💡 Tree is printed above - manually copy if needed")
+    return tree_string
+
+
+def _print_footer() -> None:
+    line = "=" * BANNER_WIDTH
+    print(f"\n{line}")
+    print("Done!")
+    print(line)
 
 
 def main(
@@ -315,35 +374,16 @@ def main(
         copy_clipboard (bool): Whether to copy the tree to the clipboard.
         max_tree_depth (Optional[int]): Maximum depth for the tree view.
     """
-    print("=" * 60)
-    print("WSNET Project Utilities")
-    print("=" * 60)
-
-    print(f"\n📍 Setting up project root (depth={relative_depth})...")
-    project_root = setup_project_root(relative_depth=relative_depth)
-    print(f"   Project root: {project_root}")
+    _print_banner()
+    project_root = _setup_project_root_step(relative_depth)
 
     if auto_clean:
-        print("\n🧹 Cleaning Python artifacts...")
-        removed = clean_python_artifacts(target_dir=project_root, verbose=True)
-        print(f"   Total removed: {len(removed)} items")
+        _cleanup_step(project_root)
 
-    tree_string = ""
     if print_structure:
-        print("\n📂 Generating project structure...")
-        tree_string = print_tree(directory=project_root, max_depth=max_tree_depth)
+        _tree_step(project_root, max_tree_depth, copy_clipboard)
 
-        if copy_clipboard:
-            print("\n📋 Copying to clipboard...")
-            if copy_to_clipboard(tree_string):
-                print("   ✅ Successfully copied to clipboard!")
-            else:
-                print("   ❌ Failed to copy to clipboard")
-                print("   💡 Tree is printed above - manually copy if needed")
-
-    print("\n" + "=" * 60)
-    print("Done!")
-    print("=" * 60)
+    _print_footer()
 
 
 if __name__ == "__main__":
