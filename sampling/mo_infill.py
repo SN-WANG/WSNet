@@ -170,6 +170,7 @@ class MultiObjectiveInfill(BaseInfill):
 
         pf_norm_all = (y_obj - self.y_obj_min) / self.y_obj_range
         pf_mask     = self._compute_pareto_mask(pf_norm_all)
+        # PF is represented in normalized objective space so EHVI is dimensionless.
         self.pf_norm = pf_norm_all[pf_mask]
 
         nd_mask = np.ones(self.num_samples, dtype=bool)
@@ -179,6 +180,7 @@ class MultiObjectiveInfill(BaseInfill):
             s_exp  = chunk[:, np.newaxis, :]
             pf_exp = self.pf_norm[np.newaxis, :, :]
             diff   = pf_exp - s_exp
+            # Keep only importance samples q that are not dominated by the current PF.
             dominated = np.all(diff <= 0, axis=2) & np.any(diff < 0, axis=2)
             nd_mask[start:end] = ~np.any(dominated, axis=1)
 
@@ -192,6 +194,7 @@ class MultiObjectiveInfill(BaseInfill):
             b_exp = batch[:, np.newaxis, :]
             s_exp = self.nd_samples[np.newaxis, :, :]
             diff  = s_exp - b_exp
+            # Monte Carlo HVI weight counts how much normalized volume a sample dominates.
             self.hvi_nd[start:end] = np.sum(
                 np.all(diff >= 0, axis=2), axis=1
             ).astype(np.float64)
@@ -247,6 +250,7 @@ class MultiObjectiveInfill(BaseInfill):
         zero_var  = np.all(var_obj < 1e-12, axis=1)
         sigma_obj = np.sqrt(np.maximum(var_obj, 1e-12))
 
+        # Eq. 15: normalize mean and standard deviation into the same objective box.
         mu_norm    = (mu_obj - self.y_obj_min) / self.y_obj_range
         sigma_norm = sigma_obj / self.y_obj_range
 
@@ -257,10 +261,12 @@ class MultiObjectiveInfill(BaseInfill):
         with np.errstate(divide="ignore", invalid="ignore"):
             z = (s_exp - mu_exp) / sigma_exp
 
+        # Eq. 17: PDF_F is the product of per-objective Gaussian PDFs in normalized space.
         log_phi   = norm.logpdf(z)
         log_pdf_f = np.sum(log_phi, axis=2)
         pdf_f     = np.exp(log_pdf_f)
 
+        # Eq. 12: EHVI ~= (1 / N_E) * sum_i HVI(q_i) * PDF_F(q_i | x).
         ehvi           = (pdf_f @ self.hvi_nd) / self.num_samples
         ehvi[zero_var] = 0.0
 
@@ -269,6 +275,7 @@ class MultiObjectiveInfill(BaseInfill):
             var_c   = var_raw[:, self.constraint_idxs]
             sigma_c = np.sqrt(np.maximum(var_c, 1e-12))
             pof     = self._compute_pof_batch(mu_c, sigma_c)
+            # cEHVI = EHVI * PoF under independent feasibility weighting.
             ehvi    = ehvi * pof
 
         return ehvi.reshape(-1, 1)
@@ -330,6 +337,7 @@ class MultiObjectiveInfill(BaseInfill):
 
         w     = np.random.uniform(0.0, self.beta)
         frac  = max(w, 0.05)
+        # P_w is the top-w% cEHVI subset used by the diversity stage.
         n_top = max(1, int(self.num_candidates * frac))
         top_idxs       = np.argsort(ehvi[:, 0])[::-1][:n_top]
         p_w            = x_candidates[top_idxs]
@@ -338,6 +346,7 @@ class MultiObjectiveInfill(BaseInfill):
         mu_obj_pw     = mu_raw_pw[:, self.obj_idxs]
         mu_norm_pw    = (mu_obj_pw - self.y_obj_min) / self.y_obj_range
         diversity     = self._compute_diversity_batch(mu_norm_pw)
+        # Eq. 19: pick the point whose predicted objective is farthest from the PF.
         best_candidate = p_w[int(np.argmax(diversity))]
 
         scipy_bounds = Bounds(self.bounds[:, 0], self.bounds[:, 1])
@@ -350,6 +359,7 @@ class MultiObjectiveInfill(BaseInfill):
 
         for _ in range(self.num_restarts):
             try:
+                # Eq. 20: refine the selected candidate by local EHVI maximization.
                 res = minimize(neg_ehvi, x0=best_candidate, bounds=scipy_bounds,
                                method="L-BFGS-B")
                 if -res.fun > best_val:

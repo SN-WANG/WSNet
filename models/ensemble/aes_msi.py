@@ -196,7 +196,7 @@ class AESMSI:
         max_correlations = np.zeros(num_models, dtype=np.float64)
         for i in range(num_models):
             # Get correlations with all other models (excluding self)
-            other_corrs = np.delete(np.abs(corr_matrix[i, :]), i)
+            other_corrs = np.delete(corr_matrix[i, :], i)
             max_correlations[i] = np.max(other_corrs) if len(other_corrs) > 0 else 0.0
 
         # Avoid division by zero

@@ -27,7 +27,7 @@ The current scope includes:
 - Multi-fidelity models: `MFSMLS`, `MMFS`, `CCAMFS`
 - Ensemble models: `TAHS`, `AESMSI`
 - Neural models: `MLP`, `DeepONet`, `GeoFNO`, `HyperFlowNet`, `Transolver`
-- Optimization helpers: `MIGA`, `CFSSDA`
+- Optimization helpers: `MIGA`, `CFARSSDA`
 - Sampling utilities for LHS, single-objective infill, multi-objective infill, and multi-fidelity infill
 - Lightweight training utilities for general and rollout-based workflows
 
